@@ -3,7 +3,7 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 SLANGC=${SLANGC:-slangc}
-MONGO_SRC=${MONGO_SRC:-$ROOT/src/mongodb}
+MONGO_SRC=${MONGO_SRC:-$ROOT/src/mongo}
 
 if ! command -v "$SLANGC" >/dev/null 2>&1; then
     echo "run.sh: set SLANGC to a compiler containing encoding.float64_* helpers" >&2
@@ -13,7 +13,7 @@ fi
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mongo-bson-bench.XXXXXX")
 trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM
 cp "$ROOT/bench/bson/main.sl" "$TMP_DIR/main.sl"
-ln -s "$MONGO_SRC" "$TMP_DIR/mongodb"
+ln -s "$MONGO_SRC" "$TMP_DIR/mongo"
 cd "$TMP_DIR"
 uname -a
 "$SLANGC" --version

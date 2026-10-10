@@ -59,10 +59,10 @@ pub fn insert_one(col: Collection, doc: Document, deadline: until)
 pub fn insert_many(col: Collection, docs: [Document], ordered: bool,
                    deadline: until) -> result[Document, str] {
     if len(docs) == 0 {
-        return err("mongodb.insert_many: documents cannot be empty");
+        return err("mongo.insert_many: documents cannot be empty");
     }
     if len(docs) > DEFAULT_MAX_BSON_VALUES {
-        return err("mongodb.insert_many: document count exceeds the BSON value limit");
+        return err("mongo.insert_many: document count exceeds the BSON value limit");
     }
     let values: [Value] = [];
     let i = 0;
@@ -210,7 +210,7 @@ pub fn cursor_next(cur: Cursor, deadline: until)
             let doc = as_document(item);
             guard let found = doc else let e = err_of(doc) {
                 let ignored = cursor_close(cur, deadline);
-                return err("mongodb.cursor: batch item is not a document: " + e);
+                return err("mongo.cursor: batch item is not a document: " + e);
             }
             return ok(some(found));
         }
@@ -221,11 +221,11 @@ pub fn cursor_next(cur: Cursor, deadline: until)
         }
         if empty_batches >= 16 {
             let ignored = cursor_close(cur, deadline);
-            return err("mongodb.cursor: server returned too many empty live batches");
+            return err("mongo.cursor: server returned too many empty live batches");
         }
         if until_hit(deadline) {
             let ignored = cursor_close(cur, deadline);
-            return err("mongodb.cursor: deadline expired");
+            return err("mongo.cursor: deadline expired");
         }
         let more = mongo_cursor_get_more(cur, deadline);
         guard let _continued = more else let e = err_of(more) {
@@ -288,11 +288,11 @@ fn mongo_cursor_get_more(cur: Cursor, deadline: until) -> result[bool, str] {
     guard let reply = response else let e = err_of(response) { return err(e); }
     let cursor_field = get(reply, "cursor");
     guard let cursor_value = cursor_field else {
-        return err("mongodb.getMore: response omitted cursor");
+        return err("mongo.getMore: response omitted cursor");
     }
     let cursor_result = as_document(cursor_value);
     guard let cursor_doc = cursor_result else let e = err_of(cursor_result) {
-        return err("mongodb.getMore: invalid cursor: " + e);
+        return err("mongo.getMore: invalid cursor: " + e);
     }
     return mongo_cursor_update(cur, cursor_doc, "nextBatch");
 }
@@ -301,11 +301,11 @@ fn mongo_cursor_from_reply(col: Collection, reply: Document, batch_size: int)
                           -> result[Cursor, str] {
     let cursor_field = get(reply, "cursor");
     guard let cursor_value = cursor_field else {
-        return err("mongodb.find: response omitted cursor");
+        return err("mongo.find: response omitted cursor");
     }
     let cursor_result = as_document(cursor_value);
     guard let cursor_doc = cursor_result else let e = err_of(cursor_result) {
-        return err("mongodb.find: invalid cursor: " + e);
+        return err("mongo.find: invalid cursor: " + e);
     }
     let no_batch: [Value] = [];
     let cur = Cursor {
@@ -330,27 +330,27 @@ fn mongo_cursor_update(cur: Cursor, reply: Document, batch_name: str)
                        -> result[bool, str] {
     let id_field = get(reply, "id");
     guard let id_value = id_field else {
-        return err("mongodb.cursor: response omitted cursor id");
+        return err("mongo.cursor: response omitted cursor id");
     }
     let id_result = as_int64(id_value);
     guard let id = id_result else let e = err_of(id_result) {
-        return err("mongodb.cursor: invalid cursor id: " + e);
+        return err("mongo.cursor: invalid cursor id: " + e);
     }
     let batch_field = get(reply, batch_name);
     guard let batch_value = batch_field else {
-        return err("mongodb.cursor: response omitted " + batch_name);
+        return err("mongo.cursor: response omitted " + batch_name);
     }
     let batch_result = as_array(batch_value);
     guard let items = batch_result else let e = err_of(batch_result) {
-        return err("mongodb.cursor: invalid batch: " + e);
+        return err("mongo.cursor: invalid batch: " + e);
     }
     if len(items) > DEFAULT_MAX_BSON_VALUES {
-        return err("mongodb.cursor: batch exceeds configured value limit");
+        return err("mongo.cursor: batch exceeds configured value limit");
     }
     let i = 0;
     while i < len(items) {
         if items[i].kind != BSON_DOCUMENT {
-            return err("mongodb.cursor: batch contains a non-document value");
+            return err("mongo.cursor: batch contains a non-document value");
         }
         i = i + 1;
     }
@@ -378,12 +378,12 @@ fn mongo_check_write_reply(reply: Document) -> result[bool, str] {
     if let errors_value = write_errors {
         let errors = as_array(errors_value);
         guard let error_list = errors else {
-            return err("mongodb.write: malformed writeErrors array");
+            return err("mongo.write: malformed writeErrors array");
         }
         if len(error_list) > 0 {
             let first = as_document(error_list[0]);
             guard let detail = first else {
-                return err("mongodb.write: malformed write error entry");
+                return err("mongo.write: malformed write error entry");
             }
             let failed = mongo_write_error(detail, "write failed");
             guard let _failed = failed else let e = err_of(failed) { return err(e); }
@@ -393,7 +393,7 @@ fn mongo_check_write_reply(reply: Document) -> result[bool, str] {
     if let concern_value = concern {
         let concern_doc = as_document(concern_value);
         guard let detail = concern_doc else {
-            return err("mongodb.write: malformed writeConcernError");
+            return err("mongo.write: malformed writeConcernError");
         }
         return mongo_write_error(detail, "write concern failed");
     }
@@ -404,11 +404,11 @@ fn mongo_write_error(detail: Document, fallback: str) -> result[bool, str] {
     let message = fallback;
     let msg = get(detail, "errmsg");
     guard let msg_value = msg else {
-        return err("mongodb.write: " + fallback);
+        return err("mongo.write: " + fallback);
     }
     let msg_text = as_string(msg_value);
     guard let text = msg_text else {
-        return err("mongodb.write: malformed server error message");
+        return err("mongo.write: malformed server error message");
     }
     if len(text) > 1024 {
         message = strings.slice(text, 0, 1024);
@@ -417,19 +417,19 @@ fn mongo_write_error(detail: Document, fallback: str) -> result[bool, str] {
     }
     let code = get(detail, "code");
     guard let code_value = code else {
-        return err("mongodb.write: " + message);
+        return err("mongo.write: " + message);
     }
     if code_value.kind == BSON_INT32 || code_value.kind == BSON_INT64 {
-        return err("mongodb.write [" + to_str(code_value.int_value) + "]: " + message);
+        return err("mongo.write [" + to_str(code_value.int_value) + "]: " + message);
     }
-    return err("mongodb.write: " + message);
+    return err("mongo.write: " + message);
 }
 
 fn mongo_validate_find_options(options: FindOptions) -> result[bool, str] {
     if options.skip < 0 || options.limit < 0 || options.batch_size < 0 ||
        options.skip > 2147483647 || options.limit > 2147483647 ||
        options.batch_size > 2147483647 {
-        return err("mongodb.find: skip, limit, and batch_size must fit a non-negative int32");
+        return err("mongo.find: skip, limit, and batch_size must fit a non-negative int32");
     }
     return ok(true);
 }
@@ -437,10 +437,10 @@ fn mongo_validate_find_options(options: FindOptions) -> result[bool, str] {
 fn mongo_validate_collection(name: str) -> result[bool, str] {
     let raw = to_bytes(name);
     if len(raw) == 0 || len(raw) > 255 || bson_has_zero(raw) {
-        return err("mongodb.collection: name must be 1 to 255 bytes and contain no NUL");
+        return err("mongo.collection: name must be 1 to 255 bytes and contain no NUL");
     }
     if !bson_valid_utf8(raw, 0, len(raw)) {
-        return err("mongodb.collection: name is not valid UTF-8");
+        return err("mongo.collection: name is not valid UTF-8");
     }
     return ok(true);
 }
@@ -448,7 +448,7 @@ fn mongo_validate_collection(name: str) -> result[bool, str] {
 fn mongo_put_string(doc: Document, key: str, value: str)
                     -> result[bool, str] {
     if bson_has_zero(to_bytes(value)) {
-        return err("mongodb: string contains NUL");
+        return err("mongo: string contains NUL");
     }
     return put(doc, key, string_value(value));
 }

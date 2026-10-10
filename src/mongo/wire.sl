@@ -50,13 +50,13 @@ pub fn command_on(c: Conn, database: str, body: Document, deadline: until)
 fn mongo_command_locked(c: Conn, database: str, body: Document,
                         deadline: until) -> result[Document, str] {
     if c.closed || c.broken {
-        return err("mongodb.command: connection is closed or broken");
+        return err("mongo.command: connection is closed or broken");
     }
     if c.pool_managed && !c.pool_checked_out {
-        return err("mongodb.command: pooled connection is not checked out");
+        return err("mongo.command: pooled connection is not checked out");
     }
     if database == "" {
-        return err("mongodb.command: database cannot be empty");
+        return err("mongo.command: database cannot be empty");
     }
     let prepared = mongo_add_database(body, database);
     guard let command_body = prepared else let e = err_of(prepared) {
@@ -74,27 +74,27 @@ fn mongo_command_locked(c: Conn, database: str, body: Document,
     let sent = mongo_transport_send(c, request, deadline);
     guard let count = sent else let e = err_of(sent) {
         mongo_break_connection(c);
-        return err("mongodb.command: send failed: " + e);
+        return err("mongo.command: send failed: " + e);
     }
     if count != len(request) {
         mongo_break_connection(c);
-        return err("mongodb.command: partial message write; connection closed");
+        return err("mongo.command: partial message write; connection closed");
     }
 
     let header = mongo_transport_read(c, 16, deadline);
     guard let header_bytes = header else let e = err_of(header) {
         mongo_break_connection(c);
-        return err("mongodb.command: response header read failed: " + e);
+        return err("mongo.command: response header read failed: " + e);
     }
     let message_length = mongo_wire_read_i32(header_bytes, 0);
     if message_length < 21 || message_length > c.config.max_message_bytes {
         mongo_break_connection(c);
-        return err("mongodb.command: invalid response message length");
+        return err("mongo.command: invalid response message length");
     }
     let remainder = mongo_transport_read(c, message_length - 16, deadline);
     guard let tail = remainder else let e = err_of(remainder) {
         mongo_break_connection(c);
-        return err("mongodb.command: response body read failed: " + e);
+        return err("mongo.command: response body read failed: " + e);
     }
     let full = builder.new_bytes();
     full.write(header_bytes);
@@ -107,7 +107,7 @@ fn mongo_command_locked(c: Conn, database: str, body: Document,
     }
     let status = mongo_check_command_status(response.body);
     guard let _ok = status else let e = err_of(status) {
-        if strings.has_prefix(e, "mongodb.command protocol:") {
+        if strings.has_prefix(e, "mongo.command protocol:") {
             mongo_break_connection(c);
         }
         return err(e);
@@ -124,7 +124,7 @@ fn mongo_add_database(source: Document, database: str)
         if field.key != "$db" {
             let inserted = put(out, field.key, field.value);
             guard let _ok = inserted else let e = err_of(inserted) {
-                return err("mongodb.command: " + e);
+                return err("mongo.command: " + e);
             }
         }
         i = i + 1;
@@ -132,7 +132,7 @@ fn mongo_add_database(source: Document, database: str)
     let db_value = string_value(database);
     let inserted = put(out, "$db", db_value);
     guard let _ok = inserted else let e = err_of(inserted) {
-        return err("mongodb.command: " + e);
+        return err("mongo.command: " + e);
     }
     return ok(out);
 }
@@ -142,16 +142,16 @@ fn mongo_encode_op_msg(request_id: int, body: Document, config: Config)
     let bounds = new_limits(config.max_bson_bytes, DEFAULT_MAX_BSON_DEPTH,
                             DEFAULT_MAX_BSON_VALUES);
     guard let limits = bounds else let e = err_of(bounds) {
-        return err("mongodb.command: invalid BSON limit: " + e);
+        return err("mongo.command: invalid BSON limit: " + e);
     }
     let encoded = encode_with_limits(body, limits);
     guard let bson = encoded else let e = err_of(encoded) {
-        return err("mongodb.command: BSON encode failed: " + e);
+        return err("mongo.command: BSON encode failed: " + e);
     }
     let message_length = 21 + len(bson);
     if message_length > config.max_message_bytes ||
        message_length > 2147483647 {
-        return err("mongodb.command: request exceeds configured message limit");
+        return err("mongo.command: request exceeds configured message limit");
     }
     let out = builder.new_bytes();
     out.write(to_le(message_length)[0..4]);
@@ -167,41 +167,41 @@ fn mongo_encode_op_msg(request_id: int, body: Document, config: Config)
 fn mongo_decode_op_msg(raw: bytes, expected_response_to: int, config: Config)
                       -> result[OpMessage, str] {
     if len(raw) < 21 || len(raw) > config.max_message_bytes {
-        return err("mongodb.command protocol: response size is outside configured bounds");
+        return err("mongo.command protocol: response size is outside configured bounds");
     }
     let message_length = mongo_wire_read_i32(raw, 0);
     if message_length != len(raw) {
-        return err("mongodb.command protocol: declared message length does not match received bytes");
+        return err("mongo.command protocol: declared message length does not match received bytes");
     }
     let request_id = mongo_wire_read_i32(raw, 4);
     let response_to = mongo_wire_read_i32(raw, 8);
     let opcode = mongo_wire_read_i32(raw, 12);
     if opcode != OP_MSG {
-        return err("mongodb.command protocol: expected OP_MSG response");
+        return err("mongo.command protocol: expected OP_MSG response");
     }
     if response_to != expected_response_to {
-        return err("mongodb.command protocol: responseTo does not match request id");
+        return err("mongo.command protocol: responseTo does not match request id");
     }
     let flags = mongo_wire_read_i32(raw, 16);
     if flags != 0 {
-        return err("mongodb.command protocol: unsupported OP_MSG flags");
+        return err("mongo.command protocol: unsupported OP_MSG flags");
     }
     if raw[20] != 0 {
-        return err("mongodb.command protocol: only a single body section is supported");
+        return err("mongo.command protocol: only a single body section is supported");
     }
     let bson_length = mongo_wire_read_i32(raw, 21);
     if bson_length < 5 || bson_length > config.max_bson_bytes ||
        bson_length != len(raw) - 21 {
-        return err("mongodb.command protocol: invalid or oversized BSON body length");
+        return err("mongo.command protocol: invalid or oversized BSON body length");
     }
     let bounds = new_limits(config.max_bson_bytes, DEFAULT_MAX_BSON_DEPTH,
                             DEFAULT_MAX_BSON_VALUES);
     guard let limits = bounds else let e = err_of(bounds) {
-        return err("mongodb.command protocol: invalid BSON limit: " + e);
+        return err("mongo.command protocol: invalid BSON limit: " + e);
     }
     let decoded = decode_with_limits(raw[21..], limits);
     guard let body = decoded else let e = err_of(decoded) {
-        return err("mongodb.command protocol: invalid BSON response: " + e);
+        return err("mongo.command protocol: invalid BSON response: " + e);
     }
     return ok(OpMessage {
         request_id: request_id,
@@ -213,7 +213,7 @@ fn mongo_decode_op_msg(raw: bytes, expected_response_to: int, config: Config)
 fn mongo_check_command_status(body: Document) -> result[bool, str] {
     let found = get(body, "ok");
     guard let status = found else {
-        return err("mongodb.command protocol: response has no ok field");
+        return err("mongo.command protocol: response has no ok field");
     }
     let successful = false;
     if status.kind == BSON_DOUBLE {
@@ -221,7 +221,7 @@ fn mongo_check_command_status(body: Document) -> result[bool, str] {
     } else if status.kind == BSON_INT32 || status.kind == BSON_INT64 {
         successful = status.int_value != 0;
     } else {
-        return err("mongodb.command protocol: response ok field is not numeric");
+        return err("mongo.command protocol: response ok field is not numeric");
     }
     if successful {
         return ok(true);
@@ -229,11 +229,11 @@ fn mongo_check_command_status(body: Document) -> result[bool, str] {
     let message = "command failed";
     let details = get(body, "errmsg");
     guard let error_value = details else {
-        return err("mongodb command failed: " + message);
+        return err("mongo command failed: " + message);
     }
     let error_text = as_string(error_value);
     guard let text = error_text else {
-        return err("mongodb.command protocol: errmsg is not a string");
+        return err("mongo.command protocol: errmsg is not a string");
     }
     message = text;
     if len(message) > 1024 {
@@ -242,12 +242,12 @@ fn mongo_check_command_status(body: Document) -> result[bool, str] {
     let code_text = "";
     let code_field = get(body, "code");
     guard let code_value = code_field else {
-        return err("mongodb command failed: " + message);
+        return err("mongo command failed: " + message);
     }
     if code_value.kind == BSON_INT32 || code_value.kind == BSON_INT64 {
         code_text = " [" + to_str(code_value.int_value) + "]";
     }
-    return err("mongodb command failed" + code_text + ": " + message);
+    return err("mongo command failed" + code_text + ": " + message);
 }
 
 fn mongo_transport_send(c: Conn, payload: bytes, deadline: until)

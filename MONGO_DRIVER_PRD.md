@@ -2,14 +2,14 @@
 
 **Status:** Scope approved; initial implementation is in place. Live-server compatibility and release gates remain.
 **Repository:** `github.com/dolphlabs/mongo`
-**Import name:** `mongodb`
-**Planned package path:** `src/mongodb/`
+**Import name:** `mongo`
+**Planned package path:** `src/mongo/`
 
 ## Product goal
 
-Provide an independently versioned, installable MongoDB client for slang backend services. Applications should add one Git/tag pin in `slang.project`, import `mongodb`, and use the language's existing `net` package for non-blocking database I/O. The driver should make safe limits, TLS verification, deadlines, and explicit errors part of its contract.
+Provide an independently versioned, installable MongoDB client for slang backend services. Applications should add one Git/tag pin in `slang.project`, import `mongo`, and use the language's existing `net` package for non-blocking database I/O. The driver should make safe limits, TLS verification, deadlines, and explicit errors part of its contract.
 
-The compiler already resolves external package pins by Git URL, tag, and source directory; the short package name remains the application import. The planned install shape is therefore one `mongodb` pin pointing at this repository's `src/mongodb` directory. The driver needs one compiler-provided primitive for lossless BSON Double values: `encoding.float64_to_le` and `encoding.float64_from_le`. That prerequisite is being implemented in a separate `slang` compiler change; the driver uses it rather than implementing floating-point bit conversion in slang arithmetic.
+The compiler already resolves external package pins by Git URL, tag, and source directory; the short package name remains the application import. The planned install shape is therefore one `mongo` pin pointing at this repository's `src/mongo` directory. The driver needs one compiler-provided primitive for lossless BSON Double values: `encoding.float64_to_le` and `encoding.float64_from_le`. That prerequisite is being implemented in a separate `slang` compiler change; the driver uses it rather than implementing floating-point bit conversion in slang arithmetic.
 
 ## Project understanding
 
@@ -38,7 +38,7 @@ cursors, and a bounded connection pool.
 
 ## Proposed architecture
 
-- Keep the driver in this repository as a pure slang package under `src/mongodb/`.
+- Keep the driver in this repository as a pure slang package under `src/mongo/`.
 - Use `net.dial_until`, `net.recv_until`, and `net.send_until`; close a connection after an I/O timeout or malformed frame because the stream position is no longer trustworthy.
 - Use MongoDB's modern message format and strict message framing. Validate declared lengths, section kinds, request/response identifiers, and all BSON boundaries before allocating or indexing.
 - Keep URI parsing strict: reject malformed escapes and unsupported or misspelled options instead of ignoring them.
@@ -74,14 +74,14 @@ The current work targets the agreed single-server scope. It does not provide rep
 
 - A regression test must demonstrate each protocol or safety defect before the fix and pass after it.
 - Exercise URI parsing, BSON round trips, numeric boundaries, nested and oversized documents, truncated frames, bad lengths, request-id mismatches, command errors, timeouts, authentication failures, TLS verification, pool wakeups, and connection reuse.
-- Run `slangc test` for the package and a consumer fixture that pins the repository by Git/tag and imports `mongodb`.
+- Run `slangc test` for the package and a consumer fixture that pins the repository by Git/tag and imports `mongo`.
 - Run live MongoDB integration tests separately from the default suite.
 - Measure any claimed performance change using repeated, interleaved runs against Go on the same host and database; include p99 and RSS as well as throughput.
 - Publish versioned tags only after docs, license, supported-version policy, and clean-install verification are complete.
 
 ## Standards and source-use note
 
-The MongoDB wire protocol reference documents the command framing and modern message format. MongoDB's published specifications repository states its specifications are licensed CC BY-NC-SA. This project should not copy or adapt that material into its source or tests. Implement original slang code and validate interoperability with a real server and a separately licensed driver. See the [wire protocol reference](https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/) and [specifications repository](https://github.com/mongodb/specifications).
+The MongoDB wire protocol reference documents the command framing and modern message format. MongoDB's published specifications repository states its specifications are licensed CC BY-NC-SA. This project should not copy or adapt that material into its source or tests. Implement original slang code and validate interoperability with a real server and a separately licensed driver. See the [wire protocol reference](https://www.mongodb.com/docs/manual/reference/mongo-wire-protocol/) and [specifications repository](https://github.com/mongodb/specifications).
 
 Authentication and TLS behavior should be checked against the official [MongoDB authentication documentation](https://www.mongodb.com/docs/languages/c/c-driver/current/security/authentication/) and [TLS documentation](https://www.mongodb.com/docs/drivers/go/current/security/tls/). Do not copy driver implementation code unless its license and required attribution are deliberately handled.
 

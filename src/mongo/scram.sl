@@ -21,13 +21,13 @@ fn mongo_scram_client_proof(username: str, password: str,
                             client_nonce: str, server_first: str)
                             -> result[ScramClientProof, str] {
     if !mongo_scram_ascii(username) || !mongo_scram_ascii(password) {
-        return err("mongodb SCRAM-SHA-256 currently requires printable ASCII credentials");
+        return err("mongo SCRAM-SHA-256 currently requires printable ASCII credentials");
     }
     if len(server_first) == 0 || len(server_first) > MONGO_SCRAM_MAX_TEXT_BYTES {
-        return err("mongodb SCRAM: server-first message has an invalid size");
+        return err("mongo SCRAM: server-first message has an invalid size");
     }
     if client_nonce == "" || strings.contains(client_nonce, ",") {
-        return err("mongodb SCRAM: client nonce is invalid");
+        return err("mongo SCRAM: client nonce is invalid");
     }
     let nonce = "";
     let salt_text = "";
@@ -36,11 +36,11 @@ fn mongo_scram_client_proof(username: str, password: str,
     for attribute in strings.split(server_first, ",") {
         let separator = strings.find(attribute, "=");
         if separator != 1 || len(attribute) <= 2 {
-            return err("mongodb SCRAM: malformed server attribute");
+            return err("mongo SCRAM: malformed server attribute");
         }
         let name = strings.slice(attribute, 0, 1);
         if mongo_contains_string(seen, name) {
-            return err("mongodb SCRAM: duplicate server attribute");
+            return err("mongo SCRAM: duplicate server attribute");
         }
         push(seen, name);
         let value = strings.slice(attribute, 2, len(attribute));
@@ -51,32 +51,32 @@ fn mongo_scram_client_proof(username: str, password: str,
         } else if name == "i" {
             iterations_text = value;
         } else if name == "m" {
-            return err("mongodb SCRAM: server requires an unsupported extension");
+            return err("mongo SCRAM: server requires an unsupported extension");
         }
     }
     if !strings.has_prefix(nonce, client_nonce) || len(nonce) <= len(client_nonce) {
-        return err("mongodb SCRAM: server nonce does not extend the client nonce");
+        return err("mongo SCRAM: server nonce does not extend the client nonce");
     }
     let salt_result = encoding.base64_decode(salt_text);
     guard let salt = salt_result else {
-        return err("mongodb SCRAM: server salt is not valid base64");
+        return err("mongo SCRAM: server salt is not valid base64");
     }
     if len(salt) == 0 || len(salt) > MONGO_SCRAM_MAX_SALT_BYTES {
-        return err("mongodb SCRAM: server salt is outside the supported size");
+        return err("mongo SCRAM: server salt is outside the supported size");
     }
     let parsed_iterations = mongo_parse_decimal(iterations_text,
                                                 MONGO_SCRAM_MAX_ITERATIONS);
     guard let iterations = parsed_iterations else {
-        return err("mongodb SCRAM: invalid iteration count");
+        return err("mongo SCRAM: invalid iteration count");
     }
     if iterations < MONGO_SCRAM_MIN_ITERATIONS {
-        return err("mongodb SCRAM: server iteration count is below 4096");
+        return err("mongo SCRAM: server iteration count is below 4096");
     }
 
     let derived = crypto.pbkdf2_sha256(to_bytes(password), salt,
                                        iterations, 32);
     guard let salted_password = derived else let e = err_of(derived) {
-        return err("mongodb SCRAM: key derivation failed: " + e);
+        return err("mongo SCRAM: key derivation failed: " + e);
     }
     let client_key = crypto.hmac_sha256(salted_password, b"Client Key");
     let stored_key = crypto.sha256(client_key);
@@ -116,12 +116,12 @@ fn mongo_scram_ascii(value: str) -> bool {
 
 fn mongo_scram_message_from_bytes(raw: bytes) -> result[str, str] {
     if len(raw) == 0 || len(raw) > MONGO_SCRAM_MAX_TEXT_BYTES {
-        return err("mongodb SCRAM: server message has an invalid size");
+        return err("mongo SCRAM: server message has an invalid size");
     }
     let i = 0;
     while i < len(raw) {
         if raw[i] < 32 || raw[i] > 126 {
-            return err("mongodb SCRAM: server message is not printable ASCII");
+            return err("mongo SCRAM: server message is not printable ASCII");
         }
         i = i + 1;
     }
