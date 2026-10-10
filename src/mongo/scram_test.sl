@@ -1,7 +1,7 @@
 import "encoding";
 import "strings";
 
-fn test_mongodb_scram_sha256_rfc7677_vector() {
+fn test_mongo_scram_sha256_rfc7677_vector() {
     let server_first =
         "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0," +
         "s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
@@ -15,7 +15,7 @@ fn test_mongodb_scram_sha256_rfc7677_vector() {
            "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
 }
 
-fn test_mongodb_scram_escapes_sasl_username() {
+fn test_mongo_scram_escapes_sasl_username() {
     let server_first = "r=nonce-server,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
     let proof_result = mongo_scram_client_proof("a,b=c", "pencil", "nonce",
                                          server_first);
@@ -23,7 +23,7 @@ fn test_mongodb_scram_escapes_sasl_username() {
     assert(strings.has_prefix(to_str(proof.payload), "c=biws,r=nonce-server,p="));
 }
 
-fn test_mongodb_scram_rejects_unsafe_or_hostile_challenges() {
+fn test_mongo_scram_rejects_unsafe_or_hostile_challenges() {
     let nonce = "rOprNGfwEbeRWgbNEkqO";
     let bad_nonce = mongo_scram_client_proof("user", "pencil", nonce,
         "r=attacker,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096");

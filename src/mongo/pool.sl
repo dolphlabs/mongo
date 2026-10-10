@@ -51,15 +51,15 @@ pub fn new_pool_config(config: Config, max_open: int) -> result[Pool, str] {
 pub fn new_pool_config_with_limits(config: Config, max_open: int,
                                    max_waiters: int) -> result[Pool, str] {
     if max_open < 1 || max_open > MONGO_POOL_MAX_OPEN {
-        return err("mongodb.new_pool: max_open must be between 1 and 1024");
+        return err("mongo.new_pool: max_open must be between 1 and 1024");
     }
     if max_waiters < 0 || max_waiters > 1000000 {
-        return err("mongodb.new_pool: max_waiters must be between 0 and 1000000");
+        return err("mongo.new_pool: max_waiters must be between 0 and 1000000");
     }
     if config.tls && config.tls_context == nullptr {
         let context = net.tls_client_ctx(config.ca_file);
         guard let tls_context = context else let e = err_of(context) {
-            return err("mongodb.new_pool: TLS context failed: " + e);
+            return err("mongo.new_pool: TLS context failed: " + e);
         }
         config.tls_context = tls_context;
     }
@@ -176,7 +176,7 @@ fn mongo_pool_dial(p: Pool, deadline: until) -> result[Conn, str] {
         p.open = p.open - 1;
         mutex_unlock(p.lock);
         close_conn(c);
-        return err("mongodb pool is closed");
+        return err("mongo pool is closed");
     }
     mutex_unlock(p.lock);
     return ok(c);
@@ -225,7 +225,7 @@ pub fn acquire(p: Pool, deadline: until) -> result[Conn, str] {
     mutex_lock(p.lock);
     if p.closed {
         mutex_unlock(p.lock);
-        return err("mongodb pool is closed");
+        return err("mongo pool is closed");
     }
     let idle = mongo_pool_take_idle(p);
     guard let c = idle else {
@@ -236,13 +236,13 @@ pub fn acquire(p: Pool, deadline: until) -> result[Conn, str] {
         }
         mutex_unlock(p.lock);
         if until_hit(deadline) {
-            return err("mongodb pool: timeout waiting for a connection");
+            return err("mongo pool: timeout waiting for a connection");
         }
         let w = mongo_pool_new_waiter(deadline);
         mutex_lock(p.lock);
         if p.closed {
             mutex_unlock(p.lock);
-            return err("mongodb pool is closed");
+            return err("mongo pool is closed");
         }
         let idle_again = mongo_pool_take_idle(p);
         guard let available = idle_again else {
@@ -253,7 +253,7 @@ pub fn acquire(p: Pool, deadline: until) -> result[Conn, str] {
             }
             if p.waiting >= p.max_waiters {
                 mutex_unlock(p.lock);
-                return err("mongodb pool: waiter limit reached");
+                return err("mongo pool: waiter limit reached");
             }
             mongo_pool_enqueue(p, w);
             p.waiting = p.waiting + 1;
@@ -266,13 +266,13 @@ pub fn acquire(p: Pool, deadline: until) -> result[Conn, str] {
             let handed = w.connection;
             if outcome == MONGO_POOL_CONN {
                 guard let granted = handed else {
-                    return err("mongodb pool: waiter received no connection");
+                    return err("mongo pool: waiter received no connection");
                 }
                 return ok(granted);
             }
             if outcome == MONGO_POOL_DIAL { return mongo_pool_dial(p, deadline); }
-            if outcome == MONGO_POOL_CLOSED { return err("mongodb pool is closed"); }
-            return err("mongodb pool: timeout waiting for a connection");
+            if outcome == MONGO_POOL_CLOSED { return err("mongo pool is closed"); }
+            return err("mongo pool: timeout waiting for a connection");
         }
         mutex_unlock(p.lock);
         available.pool_checked_out = true;
@@ -284,7 +284,7 @@ pub fn acquire(p: Pool, deadline: until) -> result[Conn, str] {
 
 pub fn release(p: Pool, c: Conn) {
     if !c.pool_managed || !c.pool_checked_out {
-        panic("mongodb.release: connection was not checked out from this pool");
+        panic("mongo.release: connection was not checked out from this pool");
     }
     c.pool_checked_out = false;
     if !usable(c) {

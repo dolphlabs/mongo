@@ -13,28 +13,28 @@ pub fn connect(uri: str, deadline: until) -> result[Conn, str] {
 
 pub fn connect_config(cfg: Config, deadline: until) -> result[Conn, str] {
     if !mongo_host_valid(cfg.host) || cfg.port < 1 || cfg.port > 65535 {
-        return err("mongodb.connect: invalid host or port");
+        return err("mongo.connect: invalid host or port");
     }
     if cfg.database == "" || cfg.auth_source == "" {
-        return err("mongodb.connect: database and auth source cannot be empty");
+        return err("mongo.connect: database and auth source cannot be empty");
     }
     if cfg.max_bson_bytes < 5 || cfg.max_bson_bytes > DEFAULT_MAX_BSON_BYTES {
-        return err("mongodb.connect: BSON limit must be between 5 and 16777216 bytes");
+        return err("mongo.connect: BSON limit must be between 5 and 16777216 bytes");
     }
     if cfg.max_message_bytes < 21 ||
        cfg.max_message_bytes > DEFAULT_MAX_MESSAGE_BYTES {
-        return err("mongodb.connect: message limit must be between 21 and 50331648 bytes");
+        return err("mongo.connect: message limit must be between 21 and 50331648 bytes");
     }
     if cfg.auth_mechanism != "SCRAM-SHA-256" {
-        return err("mongodb.connect: only SCRAM-SHA-256 authentication is supported");
+        return err("mongo.connect: only SCRAM-SHA-256 authentication is supported");
     }
     if cfg.username != "" &&
        (!mongo_scram_ascii(cfg.username) || !mongo_scram_ascii(cfg.password)) {
-        return err("mongodb.connect: SCRAM-SHA-256 currently requires printable ASCII credentials");
+        return err("mongo.connect: SCRAM-SHA-256 currently requires printable ASCII credentials");
     }
     let dialed = net.dial_until(cfg.host, cfg.port, deadline);
     guard let fd = dialed else let e = err_of(dialed) {
-        return err("mongodb.connect: dial failed: " + e);
+        return err("mongo.connect: dial failed: " + e);
     }
     let ssl: rawptr = nullptr;
     if cfg.tls {
@@ -42,7 +42,7 @@ pub fn connect_config(cfg: Config, deadline: until) -> result[Conn, str] {
             let context = net.tls_client_ctx(cfg.ca_file);
             guard let ctx = context else let e = err_of(context) {
                 net.close(fd);
-                return err("mongodb.connect: TLS context failed: " + e);
+                return err("mongo.connect: TLS context failed: " + e);
             }
             cfg.tls_context = ctx;
         }
@@ -50,7 +50,7 @@ pub fn connect_config(cfg: Config, deadline: until) -> result[Conn, str] {
                                              deadline);
         guard let connected_ssl = upgraded else let e = err_of(upgraded) {
             net.close(fd);
-            return err("mongodb.connect: TLS handshake failed: " + e);
+            return err("mongo.connect: TLS handshake failed: " + e);
         }
         ssl = connected_ssl;
     }
@@ -112,7 +112,7 @@ fn mongo_handshake(c: Conn, deadline: until) -> result[bool, str] {
     if let document_reply = response {
         reply = document_reply;
     } else let e = err_of(response) {
-        if !strings.contains(e, "mongodb command failed [59]") {
+        if !strings.contains(e, "mongo command failed [59]") {
             return err(e);
         }
         let legacy = document();
@@ -132,40 +132,40 @@ fn mongo_handshake(c: Conn, deadline: until) -> result[bool, str] {
     }
     let wire_field = get(reply, "maxWireVersion");
     guard let wire_value = wire_field else {
-        return err("mongodb.connect: server hello omitted maxWireVersion");
+        return err("mongo.connect: server hello omitted maxWireVersion");
     }
     let wire = as_int(wire_value);
     guard let version = wire else let e = err_of(wire) {
-        return err("mongodb.connect: invalid maxWireVersion: " + e);
+        return err("mongo.connect: invalid maxWireVersion: " + e);
     }
     if version < 6 {
-        return err("mongodb.connect: server does not support the OP_MSG protocol");
+        return err("mongo.connect: server does not support the OP_MSG protocol");
     }
     c.server_max_wire_version = version;
     let bson_field = get(reply, "maxBsonObjectSize");
     guard let bson_value = bson_field else {
-        return err("mongodb.connect: server hello omitted maxBsonObjectSize");
+        return err("mongo.connect: server hello omitted maxBsonObjectSize");
     }
     let bson_size_result = as_int(bson_value);
     guard let server_bson_size = bson_size_result else let e = err_of(bson_size_result) {
-        return err("mongodb.connect: invalid maxBsonObjectSize: " + e);
+        return err("mongo.connect: invalid maxBsonObjectSize: " + e);
     }
     if server_bson_size < 5 {
-        return err("mongodb.connect: server maxBsonObjectSize is invalid");
+        return err("mongo.connect: server maxBsonObjectSize is invalid");
     }
     if server_bson_size < c.config.max_bson_bytes {
         c.config.max_bson_bytes = server_bson_size;
     }
     let message_field = get(reply, "maxMessageSizeBytes");
     guard let message_value = message_field else {
-        return err("mongodb.connect: server hello omitted maxMessageSizeBytes");
+        return err("mongo.connect: server hello omitted maxMessageSizeBytes");
     }
     let message_size_result = as_int(message_value);
     guard let server_message_size = message_size_result else let e = err_of(message_size_result) {
-        return err("mongodb.connect: invalid maxMessageSizeBytes: " + e);
+        return err("mongo.connect: invalid maxMessageSizeBytes: " + e);
     }
     if server_message_size < 21 {
-        return err("mongodb.connect: server maxMessageSizeBytes is invalid");
+        return err("mongo.connect: server maxMessageSizeBytes is invalid");
     }
     if server_message_size < c.config.max_message_bytes {
         c.config.max_message_bytes = server_message_size;
@@ -176,7 +176,7 @@ fn mongo_handshake(c: Conn, deadline: until) -> result[bool, str] {
 fn mongo_scram_authenticate(c: Conn, deadline: until) -> result[bool, str] {
     let random = crypto.rand(24);
     guard let random_bytes = random else let e = err_of(random) {
-        return err("mongodb SCRAM: secure nonce generation failed: " + e);
+        return err("mongo SCRAM: secure nonce generation failed: " + e);
     }
     let client_nonce = encoding.base64_encode(random_bytes);
     let client_first_bare = "n=" + mongo_scram_escape_username(c.config.username) +
@@ -184,7 +184,7 @@ fn mongo_scram_authenticate(c: Conn, deadline: until) -> result[bool, str] {
     let client_first = "n,," + client_first_bare;
     let first_payload = binary_value(to_bytes(client_first), 0);
     guard let first_binary = first_payload else let e = err_of(first_payload) {
-        return err("mongodb SCRAM: " + e);
+        return err("mongo SCRAM: " + e);
     }
     let options = document();
     let skip_empty = put(options, "skipEmptyExchange", bool_value(true));
@@ -204,40 +204,40 @@ fn mongo_scram_authenticate(c: Conn, deadline: until) -> result[bool, str] {
     guard let _f = f else let err_text = err_of(f) { return err(err_text); }
     let started = command_on(c, c.config.auth_source, start, deadline);
     guard let start_reply = started else let err_text = err_of(started) {
-        return err("mongodb SCRAM: start failed: " + err_text);
+        return err("mongo SCRAM: start failed: " + err_text);
     }
     let conversation_value = mongo_required_field(start_reply, "conversationId");
     guard let conversation_field = conversation_value else let err_text = err_of(conversation_value) {
-        return err("mongodb SCRAM: " + err_text);
+        return err("mongo SCRAM: " + err_text);
     }
     let conversation_result = as_int(conversation_field);
     guard let conversation = conversation_result else let err_text = err_of(conversation_result) {
-        return err("mongodb SCRAM: invalid conversation id: " + err_text);
+        return err("mongo SCRAM: invalid conversation id: " + err_text);
     }
     if conversation < 1 || conversation > 2147483647 {
-        return err("mongodb SCRAM: invalid conversation id");
+        return err("mongo SCRAM: invalid conversation id");
     }
     let done_value = mongo_required_field(start_reply, "done");
     guard let done_field = done_value else let err_text = err_of(done_value) {
-        return err("mongodb SCRAM: " + err_text);
+        return err("mongo SCRAM: " + err_text);
     }
     let done_result = as_bool(done_field);
     guard let start_done = done_result else let err_text = err_of(done_result) {
-        return err("mongodb SCRAM: invalid start completion flag: " + err_text);
+        return err("mongo SCRAM: invalid start completion flag: " + err_text);
     }
     if start_done {
-        return err("mongodb SCRAM: server completed authentication without a challenge");
+        return err("mongo SCRAM: server completed authentication without a challenge");
     }
     let first_server_payload = mongo_required_field(start_reply, "payload");
     guard let first_server_value = first_server_payload else let err_text = err_of(first_server_payload) {
-        return err("mongodb SCRAM: " + err_text);
+        return err("mongo SCRAM: " + err_text);
     }
     let first_server_binary = as_binary(first_server_value);
     guard let first_server_bytes = first_server_binary else let err_text = err_of(first_server_binary) {
-        return err("mongodb SCRAM: invalid server challenge: " + err_text);
+        return err("mongo SCRAM: invalid server challenge: " + err_text);
     }
     if first_server_value.subtype != 0 {
-        return err("mongodb SCRAM: server challenge must use generic binary subtype");
+        return err("mongo SCRAM: server challenge must use generic binary subtype");
     }
     let server_first_text = mongo_scram_message_from_bytes(first_server_bytes);
     guard let server_first = server_first_text else let err_text = err_of(server_first_text) {
@@ -269,29 +269,29 @@ fn mongo_scram_authenticate(c: Conn, deadline: until) -> result[bool, str] {
     guard let _c3 = c3 else let err_text = err_of(c3) { return err(err_text); }
     let continued = command_on(c, c.config.auth_source, continuation, deadline);
     guard let final_reply = continued else let err_text = err_of(continued) {
-        return err("mongodb SCRAM: continue failed: " + err_text);
+        return err("mongo SCRAM: continue failed: " + err_text);
     }
     let final_done_value = mongo_required_field(final_reply, "done");
     guard let final_done_field = final_done_value else let err_text = err_of(final_done_value) {
-        return err("mongodb SCRAM: " + err_text);
+        return err("mongo SCRAM: " + err_text);
     }
     let final_done_result = as_bool(final_done_field);
     guard let final_done = final_done_result else let err_text = err_of(final_done_result) {
-        return err("mongodb SCRAM: invalid final completion flag: " + err_text);
+        return err("mongo SCRAM: invalid final completion flag: " + err_text);
     }
     if !final_done {
-        return err("mongodb SCRAM: server did not complete authentication");
+        return err("mongo SCRAM: server did not complete authentication");
     }
     let final_payload_value = mongo_required_field(final_reply, "payload");
     guard let final_payload_field = final_payload_value else let err_text = err_of(final_payload_value) {
-        return err("mongodb SCRAM: " + err_text);
+        return err("mongo SCRAM: " + err_text);
     }
     let final_payload_result = as_binary(final_payload_field);
     guard let final_payload = final_payload_result else let err_text = err_of(final_payload_result) {
-        return err("mongodb SCRAM: invalid server proof: " + err_text);
+        return err("mongo SCRAM: invalid server proof: " + err_text);
     }
     if final_payload_field.subtype != 0 {
-        return err("mongodb SCRAM: server proof must use generic binary subtype");
+        return err("mongo SCRAM: server proof must use generic binary subtype");
     }
     let server_final_text = mongo_scram_message_from_bytes(final_payload);
     guard let server_final = server_final_text else let err_text = err_of(server_final_text) {
@@ -316,31 +316,31 @@ fn mongo_required_field(doc: Document, name: str) -> result[Value, str] {
 fn mongo_scram_verify_server_final(raw: str, expected: bytes)
                                  -> result[bool, str] {
     if len(raw) == 0 || len(raw) > MONGO_SCRAM_MAX_TEXT_BYTES {
-        return err("mongodb SCRAM: server-final message has an invalid size");
+        return err("mongo SCRAM: server-final message has an invalid size");
     }
     let signature = "";
     let seen_signature = false;
     for attribute in strings.split(raw, ",") {
         if strings.has_prefix(attribute, "e=") {
-            return err("mongodb SCRAM: server rejected authentication");
+            return err("mongo SCRAM: server rejected authentication");
         }
         if strings.has_prefix(attribute, "v=") {
             if seen_signature {
-                return err("mongodb SCRAM: duplicate server signature");
+                return err("mongo SCRAM: duplicate server signature");
             }
             seen_signature = true;
             signature = strings.slice(attribute, 2, len(attribute));
         }
     }
     if !seen_signature {
-        return err("mongodb SCRAM: server-final message omitted its signature");
+        return err("mongo SCRAM: server-final message omitted its signature");
     }
     let decoded = encoding.base64_decode(signature);
     guard let server_signature = decoded else {
-        return err("mongodb SCRAM: server signature is not valid base64");
+        return err("mongo SCRAM: server signature is not valid base64");
     }
     if !mongo_scram_equal_constant_time(expected, server_signature) {
-        return err("mongodb SCRAM: server signature verification failed");
+        return err("mongo SCRAM: server signature verification failed");
     }
     return ok(true);
 }
