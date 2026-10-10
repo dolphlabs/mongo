@@ -1,6 +1,6 @@
-# MongoDB Driver for slang — PRD
+# mongo — MongoDB driver for slang
 
-**Status:** Approved scope; implementation in progress.
+**Status:** Scope approved; initial implementation is in place. Live-server compatibility and release gates remain.
 **Repository:** `github.com/dolphlabs/mongo`
 **Import name:** `mongodb`
 **Planned package path:** `src/mongodb/`
@@ -9,7 +9,7 @@
 
 Provide an independently versioned, installable MongoDB client for slang backend services. Applications should add one Git/tag pin in `slang.project`, import `mongodb`, and use the language's existing `net` package for non-blocking database I/O. The driver should make safe limits, TLS verification, deadlines, and explicit errors part of its contract.
 
-The compiler already resolves external package pins by Git URL, tag, and source directory; the short package name remains the application import. The planned install shape is therefore one `mongodb` pin pointing at this repository's `src/mongodb` directory. The initial driver needs one compiler-provided primitive for lossless BSON Double values: `encoding.float64_to_le` and `encoding.float64_from_le`. That prerequisite is being added to the `slang` repository separately; the driver will use it rather than implementing floating-point bit conversion in slang arithmetic.
+The compiler already resolves external package pins by Git URL, tag, and source directory; the short package name remains the application import. The planned install shape is therefore one `mongodb` pin pointing at this repository's `src/mongodb` directory. The driver needs one compiler-provided primitive for lossless BSON Double values: `encoding.float64_to_le` and `encoding.float64_from_le`. That prerequisite is being implemented in a separate `slang` compiler change; the driver uses it rather than implementing floating-point bit conversion in slang arithmetic.
 
 ## Project understanding
 
@@ -46,15 +46,20 @@ cursors, and a bounded connection pool.
 - Use TLS certificate-chain and hostname verification whenever TLS is enabled. Never offer a “TLS but skip identity checks” mode as a secure default.
 - Keep the API's BSON representation and the client/connection lifecycle explicit. Avoid hidden implicit connections or unbounded response buffering.
 
-## Proposed delivery milestones
+## Delivery milestones
 
-1. **Package foundation and BSON:** project metadata, reusable BSON value/document API, bounded encoder/decoder, and malformed-input tests. Requires a slang compiler release containing the binary64 helpers above.
-2. **Single-server command client:** URI parsing, TCP/TLS, SCRAM-SHA-256, handshake, command request/response, server errors, deadlines, and fake-server tests.
-3. **Backend operations:** agreed CRUD helpers, cursor/getMore/killCursors lifecycle, bounded batches, and a connection pool with FIFO waiters and safe shutdown.
-4. **Cluster connectivity:** replica-set discovery and primary selection; add `mongodb+srv` only if selected, because SRV/TXT lookup is not exposed by the existing slang `net` API and may require a separate compiler/runtime change.
-5. **Measurement and release:** codec and database-path benchmark against the official Go driver on the same MongoDB instance and host; report throughput, p50/p99 latency, CPU, and RSS before making performance claims.
+1. **Package foundation and BSON — implemented:** metadata, dynamic BSON API, bounded encoder/decoder, and malformed-input tests. A compiler build with the separate binary64 helpers is required.
+2. **Single-server command client — implemented:** URI parsing, TCP/TLS, SCRAM-SHA-256, handshake, OP_MSG commands, server errors, deadlines, and scripted-peer tests.
+3. **Backend operations — implemented:** insert/find/update/delete helpers, cursor getMore/killCursors, bounded batches, and FIFO connection pooling with waiter limits and shutdown.
+4. **Interoperability and release — remaining:** test against a pinned live MongoDB server, verify TLS and authentication with MongoDB, define the supported server-version range, complete the consumer install fixture, then tag a release.
+5. **Cluster connectivity — deferred:** replica-set discovery and primary selection; add `mongodb+srv` only if selected, because SRV/TXT lookup is not exposed by the existing slang `net` API and may require a separate compiler/runtime change.
+6. **Measurement — partial:** `bench/bson/run.sh` compares the in-memory BSON
+   codec with the official Go MongoDB BSON codec on one host. The database-path
+   comparison remains: run both clients against the same live MongoDB instance
+   and report throughput, p50/p99 latency, CPU, and RSS before making
+   database-performance claims.
 
-The delivery order can change with the scope decision below. A direct single-server first release is smaller, but it does not provide replica-set failover or Atlas SRV URI support.
+The current work targets the agreed single-server scope. It does not provide replica-set failover or Atlas SRV URI support.
 
 ## Security and compatibility requirements
 
