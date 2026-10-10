@@ -52,14 +52,21 @@ cursors, and a bounded connection pool.
 2. **Single-server command client — implemented:** URI parsing, TCP/TLS, SCRAM-SHA-256, handshake, OP_MSG commands, server errors, deadlines, and scripted-peer tests.
 3. **Backend operations — implemented:** insert/find/update/delete helpers, cursor getMore/killCursors, bounded batches, and FIFO connection pooling with waiter limits and shutdown.
 4. **Interoperability and release — remaining:** test against a pinned live MongoDB server, verify TLS and authentication with MongoDB, define the supported server-version range, complete the consumer install fixture, then tag a release.
-5. **Cluster connectivity — deferred:** replica-set discovery and primary selection; add `mongodb+srv` only if selected, because SRV/TXT lookup is not exposed by the existing slang `net` API and may require a separate compiler/runtime change.
+5. **Cluster connectivity — initial discovery implemented:** `mongodb+srv`
+   URI parsing, bounded SRV/TXT resolution, seed validation, TXT defaults,
+   and initial writable-primary selection are available. Automatic topology
+   monitoring, failover, retryable writes, and load-balanced mode remain out
+   of scope. This package change depends on the companion compiler change for
+   `net.lookup_srv_until` and `net.lookup_txt_until`.
 6. **Measurement — partial:** `bench/bson/run.sh` compares the in-memory BSON
    codec with the official Go MongoDB BSON codec on one host. The database-path
    comparison remains: run both clients against the same live MongoDB instance
    and report throughput, p50/p99 latency, CPU, and RSS before making
    database-performance claims.
 
-The current work targets the agreed single-server scope. It does not provide replica-set failover or Atlas SRV URI support.
+The initial driver now supports direct connections and SRV seed discovery. It
+does not provide replica-set failover, topology monitoring, or live Atlas
+verification.
 
 ## Security and compatibility requirements
 

@@ -4,10 +4,10 @@ Standalone MongoDB driver package for slang. The repository and project name is
 `mongo`; applications import its package as `mongo` from `src/mongo`.
 Socket waits use slang's non-blocking `net` package.
 
-The current API supports one direct `mongodb://` endpoint, verified TLS,
-SCRAM-SHA-256, raw commands, common CRUD operations, cursors, and a bounded
-connection pool. Replica-set discovery, multiple seeds, and `mongodb+srv://`
-are not supported. The API is not yet stable or tagged for application use.
+The current API supports direct `mongodb://` endpoints and initial seed
+discovery through `mongodb+srv://`, verified TLS, SCRAM-SHA-256, raw commands,
+common CRUD operations, cursors, and a bounded connection pool. The API is not
+yet stable or tagged for application use.
 
 ## Features and limits
 
@@ -16,10 +16,20 @@ are not supported. The API is not yet stable or tagged for application use.
   Regex, Int32, Timestamp, Int64, Decimal128, MinKey, and MaxKey. Unsupported
   legacy BSON tags return errors. Decimal128 remains its 16 wire bytes and has
   no arithmetic API.
-- Strict `mongodb://` URI parsing for a single host, percent-encoded
-  credentials/database, `authSource`, `authMechanism=SCRAM-SHA-256`, `tls`,
-  `tlsCAFile`, `appName`, and `directConnection=true`. Unknown and duplicate
-  options are rejected.
+- Strict URI parsing for one direct `mongodb://` host or one
+  `mongodb+srv://` DNS name, percent-encoded credentials/database,
+  `authSource`, `authMechanism=SCRAM-SHA-256`, `tls`, `tlsCAFile`, and
+  `appName`. SRV URIs also accept `replicaSet` and `srvServiceName`. Unknown
+  and duplicate options, explicit SRV ports, and host lists are rejected.
+- SRV URIs query SRV and optional TXT records under the caller's deadline,
+  validate every seed against the URI hostname's parent domain, and try seeds
+  until a writable primary is found. SRV priority and weight are ignored.
+  TLS is enabled by default for SRV URIs; `tls=false` is an explicit override.
+  TXT records may set only `authSource`, `replicaSet`, and `loadBalanced`;
+  URI options override TXT defaults. `loadBalanced=true` is rejected.
+- Initial seed discovery runs when a connection is opened. The driver does not
+  yet monitor topology changes, reconnect after failover, or provide automatic
+  retryable writes.
 - Deadline-bounded TCP/TLS connect, handshake, authentication, commands, and
   cursor reads. TLS verifies the certificate chain and host name.
 - `command`/`command_on`, collection insert/find/update/delete helpers,
@@ -36,6 +46,10 @@ helpers `encoding.float64_to_le` and `encoding.float64_from_le`; use a slang
 compiler build that includes those helpers. The compiler change is being
 tracked separately and must land before this package can be consumed from a
 release compiler.
+
+Atlas SRV support also requires a compiler that provides the deadline-bounded
+`net.lookup_srv_until` and `net.lookup_txt_until` functions. Their implementation
+is in the companion slang compiler change.
 
 SCRAM-SHA-256 credentials are currently limited to printable ASCII. Non-ASCII
 credentials are rejected because slang does not yet provide the Unicode
@@ -83,7 +97,7 @@ import "mongo";
 import "time";
 
 let deadline = until_of(time.mono() + 5_000_000_000);
-let connected = mongo.connect("mongodb://127.0.0.1/app", deadline);
+let connected = mongo.connect("mongodb+srv://cluster.example.mongodb.net/app", deadline);
 guard let db = connected else let e = err_of(connected) { panic(e); }
 let target = mongo.collection(db, "users");
 guard let users = target else let e = err_of(target) { panic(e); }
@@ -102,13 +116,31 @@ Use `new_pool`/`new_pool_config` for concurrent requests. Always call
 `pool_insert_one`, `pool_update_one`, `pool_delete_one`, and `pool_find` manage
 checkout and release for their supported operation.
 
+For Atlas and other DNS seed-list deployments, pass a `mongodb+srv://` URI to
+`connect` or `new_pool`. The hostname must be one DNS name without a port.
+Connection setup resolves `_mongodb._tcp.<hostname>` and optional TXT defaults
+before opening any socket. It validates all returned seed names against the
+inferred parent domain, then tries seeds in resolver order until the server
+reports itself as writable primary. This is initial discovery; the current
+driver does not poll SRV records or transparently recover from topology
+changes. A single absolute deadline covers DNS and every dial and handshake
+attempt. See [MONGO_DRIVER_PRD.md](MONGO_DRIVER_PRD.md) for the driver's scope
+and remaining release gates.
+
 ## Tests
 
-Run `slangc test -v src/mongo` from this repository with a compiler build
-containing the float encoding helpers. The deterministic suite includes a
-scripted local MongoDB peer for handshake, command, CRUD, cursor getMore, and
-pool waiter handoff; it does not need a MongoDB service. The public import
-surface is smoke-tested separately with `cd tests/consumer && slangc main.sl --run`.
+Run `slangc test -v src/mongo` from this repository with the compiler build
+from the companion [slang PR #373](https://github.com/dolphlabs/slang/pull/373),
+which includes the binary64 encoding helpers, `if let` syntax, and bounded DNS
+SRV/TXT lookups. Older compilers do not include those features and cannot
+build this branch; the `slangc 0.2.0` binary tested here is one such compiler.
+The deterministic suite includes a scripted local MongoDB peer for handshake,
+command, CRUD, cursor getMore, pool waiter handoff, and writable-primary
+selection; it does not need a MongoDB service. SRV/TXT wire parsing is tested
+offline in the slang
+runtime repository. A live Atlas deployment was not used. With the companion
+compiler on `PATH`, smoke-test the public import surface using
+`cd tests/consumer && slangc main.sl --run`; it prints `mongo consumer ok`.
 
 The in-memory BSON codec benchmark compares this package with the official Go
 MongoDB BSON codec v1.17.10 on the same document and host. Run

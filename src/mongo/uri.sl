@@ -7,8 +7,15 @@ pub let DEFAULT_MAX_MESSAGE_BYTES = 50331648;
 pub gc struct Config {
     host: str,
     port: int,
+    srv: bool,
+    srv_service_name: str,
     database: str,
     auth_source: str,
+    auth_source_explicit: bool,
+    replica_set: str,
+    replica_set_explicit: bool,
+    load_balanced: bool,
+    load_balanced_explicit: bool,
     username: str,
     password: str,
     auth_mechanism: str,
@@ -34,8 +41,15 @@ pub fn new_config(host: str, port: int, database: str)
     return ok(Config {
         host: host,
         port: port,
+        srv: false,
+        srv_service_name: "mongodb",
         database: database,
         auth_source: "admin",
+        auth_source_explicit: false,
+        replica_set: "",
+        replica_set_explicit: false,
+        load_balanced: false,
+        load_balanced_explicit: false,
         username: "",
         password: "",
         auth_mechanism: "SCRAM-SHA-256",
@@ -48,17 +62,19 @@ pub fn new_config(host: str, port: int, database: str)
     });
 }
 
-// Only one mongodb:// endpoint is supported initially. Credentials and
-// database/query components use strict percent decoding; unknown options and
-// duplicate keys fail closed so security-sensitive settings cannot conflict.
+// Both schemes accept one endpoint. SRV URIs discover their seed list during
+// connect_config; credentials and query components use strict percent
+// decoding, and unknown or duplicate options fail closed.
 pub fn parse_uri(uri: str) -> result[Config, str] {
     if len(uri) > 8192 {
         return err("mongo.parse_uri: URI exceeds 8192 bytes");
     }
-    if !strings.has_prefix(uri, "mongodb://") {
-        return err("mongo.parse_uri: expected mongodb://; SRV URIs are unsupported");
+    let srv = strings.has_prefix(uri, "mongodb+srv://");
+    if !srv && !strings.has_prefix(uri, "mongodb://") {
+        return err("mongo.parse_uri: expected mongodb:// or mongodb+srv://");
     }
     let rest = strings.slice(uri, 10, len(uri));
+    if srv { rest = strings.slice(uri, 14, len(uri)); }
     let query = "";
     let query_at = strings.find(rest, "?");
     if query_at >= 0 {
@@ -124,7 +140,12 @@ pub fn parse_uri(uri: str) -> result[Config, str] {
 
     let host = authority;
     let port = DEFAULT_PORT;
-    if strings.has_prefix(authority, "[") {
+    if srv && (strings.has_prefix(authority, "[") ||
+               strings.contains(authority, ":") ||
+               strings.contains(authority, ",")) {
+        return err("mongo.parse_uri: SRV URI requires one hostname without a port");
+    }
+    if !srv && strings.has_prefix(authority, "[") {
         let close = strings.find(authority, "]");
         if close <= 1 {
             return err("mongo.parse_uri: invalid IPv6 literal");
@@ -142,7 +163,7 @@ pub fn parse_uri(uri: str) -> result[Config, str] {
             }
             port = p;
         }
-    } else {
+    } else if !srv {
         let colon = strings.rfind(authority, ":");
         if colon >= 0 {
             if strings.find(authority, ":") != colon {
@@ -163,6 +184,12 @@ pub fn parse_uri(uri: str) -> result[Config, str] {
     if strings.contains(host, ",") {
         return err("mongo.parse_uri: multiple hosts are unsupported");
     }
+    if srv {
+        host = mongo_normalize_dns_name(host);
+        if !mongo_dns_host_valid(host) {
+            return err("mongo.parse_uri: SRV host must be a valid DNS hostname");
+        }
+    }
 
     let configured = new_config(host, port, database);
     guard let cfg = configured else let e = err_of(configured) {
@@ -170,8 +197,10 @@ pub fn parse_uri(uri: str) -> result[Config, str] {
     }
     cfg.username = username;
     cfg.password = password;
+    cfg.srv = srv;
     if username != "" && has_database {
         cfg.auth_source = database;
+        cfg.auth_source_explicit = true;
     }
 
     let seen: [str] = [];
@@ -219,6 +248,36 @@ pub fn parse_uri(uri: str) -> result[Config, str] {
                     return err("mongo.parse_uri: authSource cannot be empty");
                 }
                 cfg.auth_source = value;
+                cfg.auth_source_explicit = true;
+            } else if key == "replicaset" {
+                if !srv {
+                    return err("mongo.parse_uri: replicaSet is not supported for direct connections");
+                }
+                if value == "" {
+                    return err("mongo.parse_uri: replicaSet cannot be empty");
+                }
+                cfg.replica_set = value;
+                cfg.replica_set_explicit = true;
+            } else if key == "loadbalanced" {
+                if !srv {
+                    return err("mongo.parse_uri: loadBalanced requires mongodb+srv://");
+                }
+                if value == "true" {
+                    cfg.load_balanced = true;
+                } else if value == "false" {
+                    cfg.load_balanced = false;
+                } else {
+                    return err("mongo.parse_uri: loadBalanced must be true or false");
+                }
+                cfg.load_balanced_explicit = true;
+            } else if key == "srvservicename" {
+                if !srv {
+                    return err("mongo.parse_uri: srvServiceName requires mongodb+srv://");
+                }
+                if !mongo_srv_service_valid(value) {
+                    return err("mongo.parse_uri: srvServiceName must contain only ASCII letters, digits, or hyphens");
+                }
+                cfg.srv_service_name = strings.to_lower(value);
             } else if key == "authmechanism" {
                 if value != "SCRAM-SHA-256" {
                     return err("mongo.parse_uri: only SCRAM-SHA-256 is supported");
@@ -230,6 +289,9 @@ pub fn parse_uri(uri: str) -> result[Config, str] {
                 }
                 cfg.app_name = value;
             } else if key == "directconnection" {
+                if srv {
+                    return err("mongo.parse_uri: directConnection is not supported with mongodb+srv://");
+                }
                 if value != "true" {
                     return err("mongo.parse_uri: only directConnection=true is supported");
                 }
@@ -245,8 +307,49 @@ pub fn parse_uri(uri: str) -> result[Config, str] {
         cfg.tls = true;
     } else if tls_explicit {
         cfg.tls = false;
+    } else if srv {
+        cfg.tls = true;
+    }
+    if cfg.load_balanced {
+        return err("mongo.parse_uri: loadBalanced=true is not supported");
     }
     return ok(cfg);
+}
+
+fn mongo_dns_host_valid(host: str) -> bool {
+    if host == "" || len(host) > 253 || strings.has_prefix(host, ".") ||
+       strings.has_suffix(host, ".") {
+        return false;
+    }
+    let labels = strings.split(strings.to_lower(host), ".");
+    if len(labels) < 1 { return false; }
+    for label in labels {
+        let raw = to_bytes(label);
+        if len(raw) < 1 || len(raw) > 63 || raw[0] == 45 ||
+           raw[len(raw) - 1] == 45 {
+            return false;
+        }
+        for b in raw {
+            if !((b >= 48 && b <= 57) || (b >= 97 && b <= 122) || b == 45) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn mongo_srv_service_valid(value: str) -> bool {
+    let raw = to_bytes(strings.to_lower(value));
+    if len(raw) == 0 || len(raw) > 62 || raw[0] == 45 ||
+       raw[len(raw) - 1] == 45 {
+        return false;
+    }
+    for b in raw {
+        if !((b >= 48 && b <= 57) || (b >= 97 && b <= 122) || b == 45) {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn mongo_host_valid(host: str) -> bool {

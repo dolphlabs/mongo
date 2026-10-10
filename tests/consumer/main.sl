@@ -15,6 +15,10 @@ guard let value = got else { panic("consumer lost id field"); }
 let number_result = mongo.as_int32(value);
 guard let number = number_result else let e = err_of(number_result) { panic(e); }
 assert(number == 42);
+let srv_uri = mongo.parse_uri(
+    "mongodb+srv://cluster.example.mongodb.net/app?tls=false");
+guard let srv_config = srv_uri else let e = err_of(srv_uri) { panic(e); }
+assert(srv_config.srv && !srv_config.tls);
 println("mongo consumer ok");
 
 fn compile_client_api(uri: str, deadline: until) -> result[bool, str] {
