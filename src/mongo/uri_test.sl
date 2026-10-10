@@ -14,7 +14,7 @@ fn mongo_test_uri_error(uri: str) -> str {
     panic("invalid MongoDB URI was accepted");
 }
 
-fn test_mongodb_uri_defaults_and_direct_host() {
+fn test_mongo_uri_defaults_and_direct_host() {
     let cfg = mongo_test_parse_uri("mongodb://localhost");
     assert(cfg.host == "localhost");
     assert(cfg.port == 27017);
@@ -26,7 +26,7 @@ fn test_mongodb_uri_defaults_and_direct_host() {
     assert(cfg.max_message_bytes == 50331648);
 }
 
-fn test_mongodb_uri_credentials_database_and_options() {
+fn test_mongo_uri_credentials_database_and_options() {
     let cfg = mongo_test_parse_uri(
         "mongodb://app%40user:p%3Ass%40word@db.example:27018/orders?authSource=admin&tls=true&appName=svc");
     assert(cfg.host == "db.example" && cfg.port == 27018);
@@ -36,19 +36,19 @@ fn test_mongodb_uri_credentials_database_and_options() {
     assert(cfg.auth_mechanism == "SCRAM-SHA-256");
 }
 
-fn test_mongodb_uri_ipv6_and_percent_decoded_database() {
+fn test_mongo_uri_ipv6_and_percent_decoded_database() {
     let cfg = mongo_test_parse_uri("mongodb://[::1]:27019/team%20db?directConnection=true");
     assert(cfg.host == "::1" && cfg.port == 27019);
     assert(cfg.database == "team db");
     assert(cfg.auth_source == "admin");
 }
 
-fn test_mongodb_uri_tls_ca_file_enables_verified_tls() {
+fn test_mongo_uri_tls_ca_file_enables_verified_tls() {
     let cfg = mongo_test_parse_uri("mongodb://db.example/orders?tlsCAFile=%2Fetc%2Fmongo-ca.pem");
     assert(cfg.tls && cfg.ca_file == "/etc/mongo-ca.pem");
 }
 
-fn test_mongodb_uri_rejects_ambiguous_or_unsupported_hosts() {
+fn test_mongo_uri_rejects_ambiguous_or_unsupported_hosts() {
     assert(mongo_test_uri_error("mongodb+srv://cluster.example/db") != "");
     assert(mongo_test_uri_error("mongodb://db1,db2/db") != "");
     assert(mongo_test_uri_error("mongodb://2001:db8::1/db") != "");
@@ -57,7 +57,7 @@ fn test_mongodb_uri_rejects_ambiguous_or_unsupported_hosts() {
     assert(mongo_test_uri_error("mongodb:///db") != "");
 }
 
-fn test_mongodb_uri_rejects_bad_credentials_and_query_options() {
+fn test_mongo_uri_rejects_bad_credentials_and_query_options() {
     assert(mongo_test_uri_error("mongodb://user%ZZ@db.example/db") != "");
     assert(mongo_test_uri_error("mongodb://user:p%00ss@db.example/db") != "");
     assert(mongo_test_uri_error("mongodb://db.example/db/other") != "");

@@ -1,7 +1,7 @@
 # mongo
 
 Standalone MongoDB driver package for slang. The repository and project name is
-`mongo`; applications import its package as `mongodb` from `src/mongodb`.
+`mongo`; applications import its package as `mongo` from `src/mongo`.
 Socket waits use slang's non-blocking `net` package.
 
 The current API supports one direct `mongodb://` endpoint, verified TLS,
@@ -55,23 +55,23 @@ creating duplicate keys.
 After the first tagged release, add this pin to an application `slang.project`:
 
 ```text
-pkg mongodb git https://github.com/dolphlabs/mongo.git tag v0.1.0 dir src/mongodb
+pkg mongo git https://github.com/dolphlabs/mongo.git tag v0.1.0 dir src/mongo
 ```
 
-Then run `slangc get` and import `mongodb` from slang source. Until a release is
+Then run `slangc get` and import `mongo` from slang source. Until a release is
 tagged, the API and install pin are not stable.
 
 ## Example
 
 ```slang
-import "mongodb";
+import "mongo";
 
-let user = mongodb.document();
-let id = mongodb.int32_value(42);
+let user = mongo.document();
+let id = mongo.int32_value(42);
 guard let id_value = id else let e = err_of(id) { panic(e); }
-let saved = mongodb.put(user, "id", id_value);
+let saved = mongo.put(user, "id", id_value);
 guard let _saved = saved else let e = err_of(saved) { panic(e); }
-let body = mongodb.encode(user);
+let body = mongo.encode(user);
 guard let raw = body else let e = err_of(body) { panic(e); }
 ```
 
@@ -79,21 +79,21 @@ For a connection, create one absolute deadline and pass it through the whole
 operation:
 
 ```slang
-import "mongodb";
+import "mongo";
 import "time";
 
 let deadline = until_of(time.mono() + 5_000_000_000);
-let connected = mongodb.connect("mongodb://127.0.0.1/app", deadline);
+let connected = mongo.connect("mongodb://127.0.0.1/app", deadline);
 guard let db = connected else let e = err_of(connected) { panic(e); }
-let target = mongodb.collection(db, "users");
+let target = mongo.collection(db, "users");
 guard let users = target else let e = err_of(target) { panic(e); }
-let filter = mongodb.document();
-let found = mongodb.find_one(users, filter, deadline);
+let filter = mongo.document();
+let found = mongo.find_one(users, filter, deadline);
 guard let maybe_user = found else let e = err_of(found) { panic(e); }
 if let user = maybe_user {
-    let name = mongodb.get(user, "name");
+    let name = mongo.get(user, "name");
 }
-mongodb.close_conn(db);
+mongo.close_conn(db);
 ```
 
 Use `new_pool`/`new_pool_config` for concurrent requests. Always call
@@ -104,7 +104,7 @@ checkout and release for their supported operation.
 
 ## Tests
 
-Run `slangc test -v src/mongodb` from this repository with a compiler build
+Run `slangc test -v src/mongo` from this repository with a compiler build
 containing the float encoding helpers. The deterministic suite includes a
 scripted local MongoDB peer for handshake, command, CRUD, cursor getMore, and
 pool waiter handoff; it does not need a MongoDB service. The public import
@@ -120,7 +120,7 @@ numbers.
 
 ## Design notes
 
-See [MONGODB_DRIVER_PRD.md](MONGODB_DRIVER_PRD.md) for scope, remaining work,
+See [MONGO_DRIVER_PRD.md](MONGO_DRIVER_PRD.md) for scope, remaining work,
 test requirements, security boundaries, and source-use notes.
 
 ## License
