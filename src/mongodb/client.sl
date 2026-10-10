@@ -63,6 +63,8 @@ pub fn connect_config(cfg: Config, deadline: until) -> result[Conn, str] {
         lock: make_mutex(),
         closed: false,
         broken: false,
+        pool_managed: false,
+        pool_checked_out: false,
         server_max_wire_version: 0
     };
     let hello = mongo_handshake(connection, deadline);

@@ -15,6 +15,7 @@ pub gc struct FindOptions {
 
 pub gc struct Cursor {
     connection: Conn,
+    pool: opt[Pool],
     collection: str,
     id: int,
     batch: [Value],
@@ -60,6 +61,9 @@ pub fn insert_many(col: Collection, docs: [Document], ordered: bool,
     if len(docs) == 0 {
         return err("mongodb.insert_many: documents cannot be empty");
     }
+    if len(docs) > DEFAULT_MAX_BSON_VALUES {
+        return err("mongodb.insert_many: document count exceeds the BSON value limit");
+    }
     let values: [Value] = [];
     let i = 0;
     while i < len(docs) {
@@ -78,6 +82,10 @@ pub fn insert_many(col: Collection, docs: [Document], ordered: bool,
 
 pub fn find(col: Collection, filter: Document, options: FindOptions,
             deadline: until) -> result[Cursor, str] {
+    let valid_collection = mongo_validate_collection(col.name);
+    guard let _collection = valid_collection else let e = err_of(valid_collection) {
+        return err(e);
+    }
     let valid = mongo_validate_find_options(options);
     guard let _valid = valid else let e = err_of(valid) { return err(e); }
     let command_doc = document();
@@ -100,19 +108,11 @@ pub fn find(col: Collection, filter: Document, options: FindOptions,
         let added = put(command_doc, "batchSize", size);
         guard let _added = added else let e = err_of(added) { return err(e); }
     }
-    guard let projection = options.projection else {
-        let no_projection: opt[Document] = none;
-        projection = no_projection;
-    }
-    if let projection_doc = projection {
+    if let projection_doc = options.projection {
         let added = put(command_doc, "projection", document_value(projection_doc));
         guard let _added = added else let e = err_of(added) { return err(e); }
     }
-    guard let sort = options.sort else {
-        let no_sort: opt[Document] = none;
-        sort = no_sort;
-    }
-    if let sort_doc = sort {
+    if let sort_doc = options.sort {
         let added = put(command_doc, "sort", document_value(sort_doc));
         guard let _added = added else let e = err_of(added) { return err(e); }
     }
@@ -199,6 +199,7 @@ fn mongo_delete(col: Collection, filter: Document, limit: int,
 pub fn cursor_next(cur: Cursor, deadline: until)
                    -> result[opt[Document], str] {
     if cur.closed {
+        mongo_cursor_release_pool(cur);
         return ok(none);
     }
     let empty_batches = 0;
@@ -208,25 +209,27 @@ pub fn cursor_next(cur: Cursor, deadline: until)
             cur.index = cur.index + 1;
             let doc = as_document(item);
             guard let found = doc else let e = err_of(doc) {
-                cur.closed = true;
+                let ignored = cursor_close(cur, deadline);
                 return err("mongodb.cursor: batch item is not a document: " + e);
             }
             return ok(some(found));
         }
         if cur.id == 0 {
             cur.closed = true;
+            mongo_cursor_release_pool(cur);
             return ok(none);
         }
         if empty_batches >= 16 {
-            cur.closed = true;
+            let ignored = cursor_close(cur, deadline);
             return err("mongodb.cursor: server returned too many empty live batches");
         }
         if until_hit(deadline) {
+            let ignored = cursor_close(cur, deadline);
             return err("mongodb.cursor: deadline expired");
         }
         let more = mongo_cursor_get_more(cur, deadline);
         guard let _continued = more else let e = err_of(more) {
-            cur.closed = true;
+            let ignored = cursor_close(cur, deadline);
             return err(e);
         }
         if len(cur.batch) == 0 {
@@ -238,7 +241,14 @@ pub fn cursor_next(cur: Cursor, deadline: until)
 pub fn cursor_close(cur: Cursor, deadline: until) -> result[bool, str] {
     if cur.closed || cur.id == 0 {
         cur.closed = true;
+        mongo_cursor_release_pool(cur);
         return ok(true);
+    }
+    let valid_collection = mongo_validate_collection(cur.collection);
+    guard let _collection = valid_collection else let e = err_of(valid_collection) {
+        cur.closed = true;
+        mongo_cursor_release_pool(cur);
+        return err(e);
     }
     let ids: [Value] = [];
     push(ids, int64_value(cur.id));
@@ -255,11 +265,16 @@ pub fn cursor_close(cur: Cursor, deadline: until) -> result[bool, str] {
     }
     let response = command(cur.connection, command_doc, deadline);
     cur.closed = true;
+    mongo_cursor_release_pool(cur);
     guard let _reply = response else let e = err_of(response) { return err(e); }
     return ok(true);
 }
 
 fn mongo_cursor_get_more(cur: Cursor, deadline: until) -> result[bool, str] {
+    let valid_collection = mongo_validate_collection(cur.collection);
+    guard let _collection = valid_collection else let e = err_of(valid_collection) {
+        return err(e);
+    }
     let command_doc = document();
     let id_added = put(command_doc, "getMore", int64_value(cur.id));
     guard let _id = id_added else let e = err_of(id_added) { return err(e); }
@@ -271,7 +286,15 @@ fn mongo_cursor_get_more(cur: Cursor, deadline: until) -> result[bool, str] {
     }
     let response = command(cur.connection, command_doc, deadline);
     guard let reply = response else let e = err_of(response) { return err(e); }
-    return mongo_cursor_update(cur, reply, "nextBatch");
+    let cursor_field = get(reply, "cursor");
+    guard let cursor_value = cursor_field else {
+        return err("mongodb.getMore: response omitted cursor");
+    }
+    let cursor_result = as_document(cursor_value);
+    guard let cursor_doc = cursor_result else let e = err_of(cursor_result) {
+        return err("mongodb.getMore: invalid cursor: " + e);
+    }
+    return mongo_cursor_update(cur, cursor_doc, "nextBatch");
 }
 
 fn mongo_cursor_from_reply(col: Collection, reply: Document, batch_size: int)
@@ -287,6 +310,7 @@ fn mongo_cursor_from_reply(col: Collection, reply: Document, batch_size: int)
     let no_batch: [Value] = [];
     let cur = Cursor {
         connection: col.connection,
+        pool: none,
         collection: col.name,
         id: 0,
         batch: no_batch,
@@ -338,6 +362,10 @@ fn mongo_cursor_update(cur: Cursor, reply: Document, batch_name: str)
 
 fn mongo_write_command(col: Collection, body: Document, deadline: until)
                        -> result[Document, str] {
+    let valid_collection = mongo_validate_collection(col.name);
+    guard let _collection = valid_collection else let e = err_of(valid_collection) {
+        return err(e);
+    }
     let response = command(col.connection, body, deadline);
     guard let reply = response else let e = err_of(response) { return err(e); }
     let valid = mongo_check_write_reply(reply);
@@ -347,27 +375,29 @@ fn mongo_write_command(col: Collection, body: Document, deadline: until)
 
 fn mongo_check_write_reply(reply: Document) -> result[bool, str] {
     let write_errors = get(reply, "writeErrors");
-    guard let errors_value = write_errors else {
-        let concern = get(reply, "writeConcernError");
-        guard let concern_value = concern else { return ok(true); }
+    if let errors_value = write_errors {
+        let errors = as_array(errors_value);
+        guard let error_list = errors else {
+            return err("mongodb.write: malformed writeErrors array");
+        }
+        if len(error_list) > 0 {
+            let first = as_document(error_list[0]);
+            guard let detail = first else {
+                return err("mongodb.write: malformed write error entry");
+            }
+            let failed = mongo_write_error(detail, "write failed");
+            guard let _failed = failed else let e = err_of(failed) { return err(e); }
+        }
+    }
+    let concern = get(reply, "writeConcernError");
+    if let concern_value = concern {
         let concern_doc = as_document(concern_value);
         guard let detail = concern_doc else {
             return err("mongodb.write: malformed writeConcernError");
         }
         return mongo_write_error(detail, "write concern failed");
     }
-    let errors = as_array(errors_value);
-    guard let error_list = errors else {
-        return err("mongodb.write: malformed writeErrors array");
-    }
-    if len(error_list) == 0 {
-        return ok(true);
-    }
-    let first = as_document(error_list[0]);
-    guard let detail = first else {
-        return err("mongodb.write: malformed write error entry");
-    }
-    return mongo_write_error(detail, "write failed");
+    return ok(true);
 }
 
 fn mongo_write_error(detail: Document, fallback: str) -> result[bool, str] {

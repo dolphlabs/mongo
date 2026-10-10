@@ -221,6 +221,11 @@ fn test_bson_put_replaces_and_rejects_bad_values() {
     } else let e = err_of(bad_utf8) {
         assert(e == "bson.string_bytes_value: bytes are not valid UTF-8", e);
     }
+
+    let unicode_doc = document();
+    bson_test_add(unicode_doc, "café", bson_test_i32(5));
+    let unicode_back = bson_test_decoded(bson_test_encoded(unicode_doc));
+    assert(has_field(unicode_back, "café"));
 }
 
 fn test_bson_rejects_malformed_and_over_limit_documents() {

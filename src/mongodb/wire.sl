@@ -13,6 +13,8 @@ pub gc struct Conn {
     lock: mutex,
     closed: bool,
     broken: bool,
+    pool_managed: bool,
+    pool_checked_out: bool,
     server_max_wire_version: int,
 }
 
@@ -49,6 +51,9 @@ fn mongo_command_locked(c: Conn, database: str, body: Document,
                         deadline: until) -> result[Document, str] {
     if c.closed || c.broken {
         return err("mongodb.command: connection is closed or broken");
+    }
+    if c.pool_managed && !c.pool_checked_out {
+        return err("mongodb.command: pooled connection is not checked out");
     }
     if database == "" {
         return err("mongodb.command: database cannot be empty");
