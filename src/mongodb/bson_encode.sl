@@ -117,15 +117,13 @@ fn bson_encode_frame_value(frame: EncodeFrame, index: int) -> Value {
 
 fn bson_encode_fits(frame: EncodeFrame, key: str, payload_bytes: int,
                     limits: Limits) -> bool {
-    let raw_key = to_bytes(key);
-    if bson_has_zero(raw_key) ||
-       !bson_valid_utf8(raw_key, 0, len(raw_key)) {
-        return false;
-    }
+    // Document keys enter through put(), which validates UTF-8 and NUL; the
+    // decoder applies the same checks before appending. Keep the hot sizing
+    // check allocation-free and count the UTF-8 byte length directly.
     if payload_bytes < 0 || frame.out.size() > limits.max_document_bytes {
         return false;
     }
-    let added = 1 + len(raw_key) + 1 + payload_bytes + 1;
+    let added = 1 + len(key) + 1 + payload_bytes + 1;
     return added <= limits.max_document_bytes - frame.out.size();
 }
 

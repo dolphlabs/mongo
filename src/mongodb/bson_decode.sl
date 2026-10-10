@@ -61,13 +61,11 @@ pub fn decode_with_limits(raw: bytes, limits: Limits)
                 push(parent.array_values, child_value);
                 parent.next_array_index = parent.next_array_index + 1;
             } else {
-                if bson_find_field(parent.document, child.parent_key) >= 0 {
-                    return err("bson.decode: duplicate field name " + child.parent_key);
-                }
-                let pr = put(parent.document, child.parent_key, child_value);
-                guard let _put = pr else let e = err_of(pr) {
-                    return err("bson.decode: " + e);
-                }
+                // The key was UTF-8 and duplicate-checked before its child
+                // frame was pushed. Appending here avoids scanning all
+                // preceding fields a second time through put().
+                bson_decode_append(parent.document, child.parent_key,
+                                   child_value);
             }
             continue;
         }
@@ -132,14 +130,16 @@ pub fn decode_with_limits(raw: bytes, limits: Limits)
             push(frame.array_values, decoded.value);
             frame.next_array_index = frame.next_array_index + 1;
         } else {
-            let pr = put(frame.document, key, decoded.value);
-            guard let _put = pr else let e = err_of(pr) {
-                return err("bson.decode: " + e);
-            }
+            // The key was UTF-8 and duplicate-checked above.
+            bson_decode_append(frame.document, key, decoded.value);
         }
     }
 
     return err("bson.decode: internal traversal ended without a document");
+}
+
+fn bson_decode_append(doc: Document, key: str, value: Value) {
+    push(doc.fields, Field { key: key, value: value });
 }
 
 fn bson_new_decode_frame(start: int, size: int, depth: int,
