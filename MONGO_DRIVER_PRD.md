@@ -51,22 +51,68 @@ cursors, and a bounded connection pool.
 1. **Package foundation and BSON — implemented:** metadata, dynamic BSON API, bounded encoder/decoder, and malformed-input tests. A compiler build with the separate binary64 helpers is required.
 2. **Single-server command client — implemented:** URI parsing, TCP/TLS, SCRAM-SHA-256, handshake, OP_MSG commands, server errors, deadlines, and scripted-peer tests.
 3. **Backend operations — implemented:** insert/find/update/delete helpers, cursor getMore/killCursors, bounded batches, and FIFO connection pooling with waiter limits and shutdown.
-4. **Interoperability and release — remaining:** test against a pinned live MongoDB server, verify TLS and authentication with MongoDB, define the supported server-version range, complete the consumer install fixture, then tag a release.
+4. **Interoperability and release — remaining:** direct CRUD, update, insert, and cursor reads were exercised against MongoDB 8.2.12 on 2026-10-11. Authenticated and TLS live-server coverage, the supported server-version range, clean consumer install, and a release tag remain.
 5. **Cluster connectivity — initial discovery implemented:** `mongodb+srv`
    URI parsing, bounded SRV/TXT resolution, seed validation, TXT defaults,
    and initial writable-primary selection are available. Automatic topology
    monitoring, failover, retryable writes, and load-balanced mode remain out
    of scope. This package change depends on the companion compiler change for
    `net.lookup_srv_until` and `net.lookup_txt_until`.
-6. **Measurement — partial:** `bench/bson/run.sh` compares the in-memory BSON
-   codec with the official Go MongoDB BSON codec on one host. The database-path
-   comparison remains: run both clients against the same live MongoDB instance
-   and report throughput, p50/p99 latency, CPU, and RSS before making
-   database-performance claims.
+6. **Measurement — live database baseline complete (2026-10-11):** `bench/bson/run.sh` compares the in-memory BSON codec with the official Go MongoDB BSON codec. A separate 64-run live comparison used MongoDB 8.2.12, 500,000 seeded 1 KiB documents, three indexes, and four interleaved samples per client and route/concurrency pair. Reads, updates, and inserts were within 2%–17% of Go throughput; the sorted 50-document range path reached 23% of Go at 16 workers (628 vs 2,684 requests/s), with p50/p99 of 19.71/64.00 ms vs 5.40/14.21 ms. All correctness checks passed. This is a local Mac-plus-Docker diagnostic, not a cloud deployment baseline; the full interpretation and next work are below.
 
 The initial driver now supports direct connections and SRV seed discovery. It
 does not provide replica-set failover, topology monitoring, or live Atlas
 verification.
+
+## Current API coverage and ordered next work
+
+`command`, `command_on`, and their pool variants accept caller-built BSON
+command documents. An application can manually construct an `aggregate`
+command and pipeline using the existing `Document` and `Array` types. The reply
+is a raw `Document`, however: there is no `aggregate` helper that creates the
+package `Cursor` and manages `firstBatch`, `getMore`, and early close. There is
+also no first-class `Session` or transaction API that manages `lsid`,
+`txnNumber`, transaction state, and session-aware operations. These features
+are not currently supported as driver-managed APIs.
+
+Work these items in order, one change at a time:
+
+1. **Profile and optimize sorted range reads.** The live baseline used 50
+   sorted documents per request, each with a 1 KiB payload. At 16 workers,
+   median throughput was 628 requests/s for slang and 2,684 for Go; p50/p99
+   were 19.71/64.00 ms and 5.40/14.21 ms respectively. MongoDB's explain plan
+   returned and examined exactly 50 documents and 50 keys through the
+   `tenant_seq` index. Profile client-side BSON decode, dynamic document
+   materialization, field lookup, string conversion, and allocation/GC before
+   changing code. The benchmark validates each returned payload; `as_string`
+   also validates UTF-8 and materializes slang strings, so measure that cost
+   separately before attributing the whole gap to wire decoding. Keep a
+   repeated Go comparison with p99 and client RSS. Target at least 98% of Go's
+   throughput and p99 no more than 2% above Go on the same stable host, without
+   regressing point CRUD or correctness.
+2. **Add aggregation and pipeline cursor support.** Expose an `aggregate` and
+   pooled equivalent that accept dynamic `[Document]` pipeline stages and
+   return the existing bounded `Cursor`, including `getMore`, deadlines, and
+   `killCursors` cleanup. Start without a fluent stage-builder DSL: the BSON
+   `Document`/`Value` API already lets callers express server pipeline stages.
+   Keep options narrow initially (at least batch size), and test multiple
+   batches, early close, malformed replies, server errors, and live `$match`,
+   `$sort`, `$group`, and `$project` results.
+3. **Add explicit sessions and replica-set transactions.** Define a public
+   session handle and explicit begin, commit, abort, and end operations; do not
+   use a callback-based helper because slang has no closures. Carry `lsid` and
+   transaction fields through session-aware CRUD and aggregation calls, keep
+   operations on the selected writable-primary topology, and report ambiguous
+   commit outcomes without retrying writes blindly. Start with replica sets;
+   sharded transaction routing remains deferred until mongos routing exists.
+   Validate commit, abort/rollback, expiry, command errors, and concurrent
+   session isolation against a replica-set test deployment.
+4. **Close release gates.** Add pinned-server integration coverage for TLS and
+   authentication, state the supported MongoDB server range and remaining
+   topology limits, run the consumer install fixture from a clean cache, then
+   tag a release. Keep change streams, retryable writes, failover monitoring,
+   sharded routing, and load-balanced mode out of scope until separately
+   prioritized.
 
 ## Security and compatibility requirements
 

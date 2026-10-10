@@ -36,6 +36,10 @@ yet stable or tagged for application use.
   `find_one`, `getMore`/`killCursors`, and a FIFO connection pool. A pool allows
   at most 1,024 open connections and defaults to 10,000 queued waiters; use
   `new_pool_config_with_limits` to set a lower waiter cap.
+- Raw commands can send an aggregation command built from BSON documents and
+  arrays, but there is no managed aggregation cursor helper yet. Sessions and
+  transactions are not supported as first-class APIs; raw command access does
+  not manage their session lifecycle.
 - Default caps of 16 MiB per BSON document, 48 MiB per wire message, 100 nested
   levels, and 100,000 BSON values per document. `new_limits` configures codec
   limits, while `Config.max_bson_bytes` and `Config.max_message_bytes` may be
