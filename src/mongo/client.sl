@@ -28,25 +28,45 @@ pub fn connect_config(cfg: Config, deadline: until) -> result[Conn, str] {
     if cfg.auth_mechanism != "SCRAM-SHA-256" {
         return err("mongo.connect: only SCRAM-SHA-256 authentication is supported");
     }
+    if cfg.load_balanced {
+        return err("mongo.connect: loadBalanced=true is not supported");
+    }
     if cfg.username != "" &&
        (!mongo_scram_ascii(cfg.username) || !mongo_scram_ascii(cfg.password)) {
         return err("mongo.connect: SCRAM-SHA-256 currently requires printable ASCII credentials");
     }
-    let dialed = net.dial_until(cfg.host, cfg.port, deadline);
+    if cfg.srv {
+        let discovery = mongo_srv_discover(cfg, deadline);
+        guard let resolved = discovery else let e = err_of(discovery) {
+            return err(e);
+        }
+        return mongo_connect_seeds(resolved.config, resolved.seeds, deadline);
+    }
+    return mongo_connect_host(cfg, cfg.host, cfg.port, deadline, false);
+}
+
+fn mongo_connect_host(cfg: Config, host: str, port: int, deadline: until,
+                      require_primary: bool) -> result[Conn, str] {
+    if !mongo_host_valid(host) || port < 1 || port > 65535 {
+        return err("mongo.connect: invalid seed host or port");
+    }
+    let endpoint = cfg;
+    endpoint.host = host;
+    endpoint.port = port;
+    if endpoint.tls && endpoint.tls_context == nullptr {
+        let context = net.tls_client_ctx(endpoint.ca_file);
+        guard let ctx = context else let e = err_of(context) {
+            return err("mongo.connect: TLS context failed: " + e);
+        }
+        endpoint.tls_context = ctx;
+    }
+    let dialed = net.dial_until(host, port, deadline);
     guard let fd = dialed else let e = err_of(dialed) {
         return err("mongo.connect: dial failed: " + e);
     }
     let ssl: rawptr = nullptr;
-    if cfg.tls {
-        if cfg.tls_context == nullptr {
-            let context = net.tls_client_ctx(cfg.ca_file);
-            guard let ctx = context else let e = err_of(context) {
-                net.close(fd);
-                return err("mongo.connect: TLS context failed: " + e);
-            }
-            cfg.tls_context = ctx;
-        }
-        let upgraded = net.tls_upgrade_until(fd, cfg.host, cfg.tls_context,
+    if endpoint.tls {
+        let upgraded = net.tls_upgrade_until(fd, host, endpoint.tls_context,
                                              deadline);
         guard let connected_ssl = upgraded else let e = err_of(upgraded) {
             net.close(fd);
@@ -55,7 +75,7 @@ pub fn connect_config(cfg: Config, deadline: until) -> result[Conn, str] {
         ssl = connected_ssl;
     }
     let connection = Conn {
-        config: cfg,
+        config: endpoint,
         fd: fd,
         ssl: ssl,
         tls: cfg.tls,
@@ -65,14 +85,19 @@ pub fn connect_config(cfg: Config, deadline: until) -> result[Conn, str] {
         broken: false,
         pool_managed: false,
         pool_checked_out: false,
-        server_max_wire_version: 0
+        server_max_wire_version: 0,
+        is_writable_primary: false
     };
     let hello = mongo_handshake(connection, deadline);
     guard let _hello = hello else let e = err_of(hello) {
         close_conn(connection);
         return err(e);
     }
-    if cfg.username != "" {
+    if require_primary && !connection.is_writable_primary {
+        close_conn(connection);
+        return err("mongo.connect: seed is not a writable primary");
+    }
+    if endpoint.username != "" {
         let authenticated = mongo_scram_authenticate(connection, deadline);
         guard let _auth = authenticated else let e = err_of(authenticated) {
             close_conn(connection);
@@ -142,6 +167,36 @@ fn mongo_handshake(c: Conn, deadline: until) -> result[bool, str] {
         return err("mongo.connect: server does not support the OP_MSG protocol");
     }
     c.server_max_wire_version = version;
+    let primary = get(reply, "isWritablePrimary");
+    if let primary_value = primary {
+        let primary_result = as_bool(primary_value);
+        guard let is_primary = primary_result else let e = err_of(primary_result) {
+            return err("mongo.connect: invalid isWritablePrimary: " + e);
+        }
+        c.is_writable_primary = is_primary;
+    } else {
+        let legacy_primary = get(reply, "ismaster");
+        if let legacy_value = legacy_primary {
+            let primary_result = as_bool(legacy_value);
+            guard let is_primary = primary_result else let e = err_of(primary_result) {
+                return err("mongo.connect: invalid ismaster: " + e);
+            }
+            c.is_writable_primary = is_primary;
+        }
+    }
+    if c.config.replica_set != "" {
+        let set_name_value = get(reply, "setName");
+        guard let set_name = set_name_value else {
+            return err("mongo.connect: server hello omitted setName for replicaSet");
+        }
+        let set_name_result = as_string(set_name);
+        guard let actual_set = set_name_result else let e = err_of(set_name_result) {
+            return err("mongo.connect: invalid replica set name: " + e);
+        }
+        if actual_set != c.config.replica_set {
+            return err("mongo.connect: server belongs to a different replica set");
+        }
+    }
     let bson_field = get(reply, "maxBsonObjectSize");
     guard let bson_value = bson_field else {
         return err("mongo.connect: server hello omitted maxBsonObjectSize");

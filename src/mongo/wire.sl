@@ -16,6 +16,7 @@ pub gc struct Conn {
     pool_managed: bool,
     pool_checked_out: bool,
     server_max_wire_version: int,
+    is_writable_primary: bool,
 }
 
 struct OpMessage {

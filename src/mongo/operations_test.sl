@@ -50,7 +50,8 @@ fn test_mongo_cursor_first_batch_values() {
             broken: false,
             pool_managed: false,
             pool_checked_out: false,
-            server_max_wire_version: 0
+            server_max_wire_version: 0,
+            is_writable_primary: false
         },
         pool: none,
         collection: "users",
@@ -95,7 +96,8 @@ fn test_mongo_cursor_deadline_releases_connection() {
         broken: false,
         pool_managed: false,
         pool_checked_out: false,
-        server_max_wire_version: 0
+        server_max_wire_version: 0,
+        is_writable_primary: false
     };
     let no_batch: [Value] = [];
     let cur = Cursor {
@@ -375,6 +377,63 @@ fn test_mongo_network_connect_crud_and_cursor_get_more() {
         return;
     }
     panic("MongoDB cursor returned extra rows after getMore exhausted it");
+}
+
+fn mongo_test_seed_hello_server(listener: i32, writable: bool,
+                               done: chan[int]) {
+    let deadline = until_of(time.mono() + 5000000000);
+    let accepted = net.accept(listener);
+    guard let fd = accepted else let e = err_of(accepted) { panic(e); }
+    let header = mongo_test_read_exact(fd, 16, deadline);
+    let size = mongo_wire_read_i32(header, 0);
+    if size < 21 || size > DEFAULT_MAX_MESSAGE_BYTES {
+        panic("mock seed received an invalid hello length");
+    }
+    let tail = mongo_test_read_exact(fd, size - 16, deadline);
+    let raw = header + tail;
+    let request_id = mongo_wire_read_i32(raw, 4);
+    let reply = document();
+    mongo_operations_test_add(reply, "ok", double_value(1.0));
+    mongo_operations_test_add(reply, "maxWireVersion", int32_test_value(21));
+    mongo_operations_test_add(reply, "maxBsonObjectSize",
+                              int32_test_value(DEFAULT_MAX_BSON_BYTES));
+    mongo_operations_test_add(reply, "maxMessageSizeBytes",
+                              int32_test_value(DEFAULT_MAX_MESSAGE_BYTES));
+    mongo_operations_test_add(reply, "isWritablePrimary", bool_value(writable));
+    mongo_operations_test_add(reply, "setName", string_value("rs-test"));
+    mongo_test_send_message(fd, request_id, reply, deadline);
+    net.close(fd);
+    net.close(listener);
+    chan_send(done, 1);
+}
+
+fn test_mongo_srv_connect_skips_secondary_and_selects_primary() {
+    let first_listener_result = net.listen(0);
+    guard let first_listener = first_listener_result else let e = err_of(first_listener_result) { panic(e); }
+    let first_port_result = net.port(first_listener);
+    guard let first_port = first_port_result else let e = err_of(first_port_result) { panic(e); }
+    let second_listener_result = net.listen(0);
+    guard let second_listener = second_listener_result else let e = err_of(second_listener_result) { panic(e); }
+    let second_port_result = net.port(second_listener);
+    guard let second_port = second_port_result else let e = err_of(second_port_result) { panic(e); }
+    let first_done: chan[int] = make_chan(1);
+    let second_done: chan[int] = make_chan(1);
+    spawn mongo_test_seed_hello_server(first_listener, false, first_done);
+    spawn mongo_test_seed_hello_server(second_listener, true, second_done);
+
+    let parsed = parse_uri("mongodb+srv://cluster.example.com/db?replicaSet=rs-test&tls=false");
+    guard let cfg = parsed else let e = err_of(parsed) { panic(e); }
+    let seeds: [MongoSeed] = [];
+    push(seeds, MongoSeed { host: "127.0.0.1", port: first_port });
+    push(seeds, MongoSeed { host: "127.0.0.1", port: second_port });
+    let connected = mongo_connect_seeds(
+        cfg, seeds, until_of(time.mono() + 5000000000));
+    guard let primary = connected else let e = err_of(connected) { panic(e); }
+    assert(primary.is_writable_primary);
+    assert(primary.config.port == second_port);
+    close_conn(primary);
+    chan_recv(first_done);
+    chan_recv(second_done);
 }
 
 fn mongo_test_pool_server(listener: i32, done: chan[int]) {
