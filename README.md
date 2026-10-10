@@ -129,13 +129,18 @@ and remaining release gates.
 
 ## Tests
 
-Run `slangc test -v src/mongo` from this repository with a compiler build
-containing the float encoding helpers. The deterministic suite includes a
-scripted local MongoDB peer for handshake, command, CRUD, cursor getMore, pool
-waiter handoff, and writable-primary selection; it does not need a MongoDB
-service. SRV/TXT wire parsing is tested offline in the slang runtime
-repository. A live Atlas deployment was not used. The public import surface is
-smoke-tested separately with `cd tests/consumer && slangc main.sl --run`.
+Run `slangc test -v src/mongo` from this repository with the compiler build
+from the companion [slang PR #373](https://github.com/dolphlabs/slang/pull/373),
+which includes the binary64 encoding helpers, `if let` syntax, and bounded DNS
+SRV/TXT lookups. Older compilers do not include those features and cannot
+build this branch; the `slangc 0.2.0` binary tested here is one such compiler.
+The deterministic suite includes a scripted local MongoDB peer for handshake,
+command, CRUD, cursor getMore, pool waiter handoff, and writable-primary
+selection; it does not need a MongoDB service. SRV/TXT wire parsing is tested
+offline in the slang
+runtime repository. A live Atlas deployment was not used. With the companion
+compiler on `PATH`, smoke-test the public import surface using
+`cd tests/consumer && slangc main.sl --run`; it prints `mongo consumer ok`.
 
 The in-memory BSON codec benchmark compares this package with the official Go
 MongoDB BSON codec v1.17.10 on the same document and host. Run
