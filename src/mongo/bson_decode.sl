@@ -1,10 +1,12 @@
+import "strings";
+
 struct DecodedBsonValue {
     value: Value,
     next: int,
 }
 
 struct BsonCString {
-    raw: bytes,
+    text: str,
     next: int,
 }
 
@@ -86,11 +88,7 @@ pub fn decode_with_limits(raw: bytes, limits: Limits)
         guard let key_result = kr else let e = err_of(kr) {
             return err("bson.decode: " + e);
         }
-        let key_bytes = key_result.raw;
-        if !bson_valid_utf8(key_bytes, 0, len(key_bytes)) {
-            return err("bson.decode: field name is not valid UTF-8");
-        }
-        let key = to_str(key_bytes);
+        let key = key_result.text;
         if !frame.array && bson_find_field(frame.document, key) >= 0 {
             return err("bson.decode: duplicate field name " + key);
         }
@@ -210,11 +208,13 @@ fn bson_read_cstring(raw: bytes, pos: int, end: int)
     if i >= end {
         return err("unterminated cstring");
     }
-    let value = raw[pos..i];
-    if !bson_valid_utf8(value, 0, len(value)) {
+    if !bson_valid_utf8(raw, pos, i) {
         return err("cstring is not valid UTF-8");
     }
-    return ok(BsonCString { raw: value, next: i + 1 });
+    return ok(BsonCString {
+        text: strings.from_bytes(raw, pos, i),
+        next: i + 1
+    });
 }
 
 fn bson_decode_scalar(raw: bytes, pos: int, end: int, kind: int)
@@ -244,15 +244,25 @@ fn bson_decode_scalar(raw: bytes, pos: int, end: int, kind: int)
         if raw[terminator] != 0 {
             return err("bson.decode: BSON string has no trailing NUL");
         }
-        let data = raw[start..terminator];
-        if !bson_valid_utf8(data, 0, len(data)) {
+        let data_len = terminator - start;
+        if !bson_valid_utf8(raw, start, terminator) {
             return err("bson.decode: string value is not valid UTF-8");
         }
-        let made = string_bytes_value(data);
-        guard let string = made else let e = err_of(made) {
-            return err("bson.decode: " + e);
+        let has_zero = false;
+        let byte_index = start;
+        while byte_index < terminator {
+            if raw[byte_index] == 0 {
+                has_zero = true;
+                break;
+            }
+            byte_index = byte_index + 1;
         }
-        value = string;
+        if has_zero {
+            value = bson_string_value_validated(raw[start..terminator]);
+        } else {
+            value = bson_string_value_text_validated(
+                strings.from_bytes(raw, start, start + data_len));
+        }
         next = terminator + 1;
     } else if kind == BSON_BINARY {
         if !bson_has_range(raw, pos, 5, end) {
@@ -347,7 +357,7 @@ fn bson_decode_scalar(raw: bytes, pos: int, end: int, kind: int)
         guard let options = options_result else let e = err_of(options_result) {
             return err("bson.decode: invalid regex options: " + e);
         }
-        let made = regex_value(to_str(pattern.raw), to_str(options.raw));
+        let made = regex_value(pattern.text, options.text);
         guard let regex = made else let e = err_of(made) {
             return err("bson.decode: " + e);
         }

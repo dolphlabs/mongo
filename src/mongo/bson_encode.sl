@@ -136,16 +136,18 @@ fn bson_encode_write_head(out: builder.Bytes, kind: int, key: str) {
 fn bson_encode_scalar(frame: EncodeFrame, key: str, value: Value,
                       limits: Limits) -> result[bool, str] {
     let payload = 0;
+    let string_data = b"";
     if value.kind == BSON_DOUBLE {
         payload = 8;
     } else if value.kind == BSON_STRING {
-        if !bson_valid_utf8(value.data, 0, len(value.data)) {
+        string_data = bson_string_bytes(value);
+        if !bson_valid_utf8(string_data, 0, len(string_data)) {
             return err("bson.encode: string value is not valid UTF-8");
         }
-        if len(value.data) >= 2147483647 {
+        if len(string_data) >= 2147483647 {
             return err("bson.encode: string value is too large");
         }
-        payload = 4 + len(value.data) + 1;
+        payload = 4 + len(string_data) + 1;
     } else if value.kind == BSON_BINARY {
         if value.subtype < 0 || value.subtype > 255 ||
            len(value.data) > 2147483647 ||
@@ -200,8 +202,8 @@ fn bson_encode_scalar(frame: EncodeFrame, key: str, value: Value,
     if value.kind == BSON_DOUBLE {
         frame.out.write(encoding.float64_to_le(value.float_value));
     } else if value.kind == BSON_STRING {
-        bson_write_i32(frame.out, len(value.data) + 1);
-        frame.out.write(value.data);
+        bson_write_i32(frame.out, len(string_data) + 1);
+        frame.out.write(string_data);
         frame.out.write_byte(0);
     } else if value.kind == BSON_BINARY {
         let wire_len = len(value.data);

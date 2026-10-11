@@ -190,7 +190,31 @@ pub fn string_bytes_value(raw: bytes) -> result[Value, str] {
     }
     let out = bson_empty_value(BSON_STRING);
     out.data = bson_copy_bytes(raw);
+    out.subtype = 1;
     return ok(out);
+}
+
+// Decoder-owned slices are already detached from the input buffer. Marking
+// them validated lets as_string avoid scanning their bytes a second time.
+fn bson_string_value_validated(data: bytes) -> Value {
+    let out = bson_empty_value(BSON_STRING);
+    out.data = data;
+    out.subtype = 1;
+    return out;
+}
+
+fn bson_string_value_text_validated(value: str) -> Value {
+    let out = bson_empty_value(BSON_STRING);
+    out.text = value;
+    out.subtype = 2;
+    return out;
+}
+
+fn bson_string_bytes(value: Value) -> bytes {
+    if value.subtype == 2 {
+        return to_bytes(value.text);
+    }
+    return value.data;
 }
 
 pub fn binary_value(raw: bytes, subtype: int) -> result[Value, str] {
@@ -280,6 +304,12 @@ pub fn array_value(values: [Value]) -> Value {
     return out;
 }
 
+fn bson_array_value_owned(values: [Value]) -> Value {
+    let out = bson_empty_value(BSON_ARRAY);
+    out.items = values;
+    return out;
+}
+
 pub fn min_key_value() -> Value {
     return bson_empty_value(BSON_MIN_KEY);
 }
@@ -292,10 +322,14 @@ pub fn as_string(value: Value) -> result[str, str] {
     if value.kind != BSON_STRING {
         return err("bson.as_string: value is not a BSON string");
     }
+    if value.subtype == 2 {
+        return ok(value.text);
+    }
     if bson_has_zero(value.data) {
         return err("bson.as_string: BSON string contains U+0000; use as_string_bytes");
     }
-    if !bson_valid_utf8(value.data, 0, len(value.data)) {
+    if value.subtype != 1 &&
+       !bson_valid_utf8(value.data, 0, len(value.data)) {
         return err("bson.as_string: BSON string is not valid UTF-8");
     }
     return ok(to_str(value.data));
@@ -304,6 +338,9 @@ pub fn as_string(value: Value) -> result[str, str] {
 pub fn as_string_bytes(value: Value) -> result[bytes, str] {
     if value.kind != BSON_STRING {
         return err("bson.as_string_bytes: value is not a BSON string");
+    }
+    if value.subtype == 2 {
+        return ok(to_bytes(value.text));
     }
     return ok(bson_copy_bytes(value.data));
 }
