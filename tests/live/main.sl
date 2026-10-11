@@ -39,6 +39,15 @@ fn live_field_string(doc: mongo.Document, key: str) -> str {
     return parsed;
 }
 
+fn live_view_field_int(doc: mongo.DocumentView, key: str) -> int {
+    let raw = mongo.view_get(doc, key);
+    guard let maybe_value = raw else let e = err_of(raw) { panic(e); }
+    guard let value = maybe_value else { panic("live MongoDB view omitted " + key); }
+    let number = mongo.view_as_int(value);
+    guard let parsed = number else let e = err_of(number) { panic(e); }
+    return parsed;
+}
+
 fn live_doc_with_id(id: str) -> mongo.Document {
     let doc = mongo.document();
     live_put_string(doc, "_id", id);
@@ -133,6 +142,44 @@ fn live_test_aggregation(pool: mongo.Pool, collection: str) {
     println("PASS live aggregation match/sort/group/project with getMore");
 }
 
+fn live_test_sorted_view(pool: mongo.Pool, collection: str) {
+    let filter = mongo.document();
+    live_put_string(filter, "category", "blue");
+    live_put(filter, "active", mongo.bool_value(true));
+    let sort = mongo.document();
+    live_put_int(sort, "score", 1);
+    let options = mongo.default_find_options();
+    options.limit = 2;
+    options.batch_size = 1;
+    options.sort = some(sort);
+    let opened = mongo.pool_find_view(pool, collection, filter, options,
+                                     live_deadline());
+    guard let cursor = opened else let e = err_of(opened) { panic(e); }
+
+    let first_result = mongo.view_cursor_next(cursor, live_deadline());
+    guard let first_opt = first_result else let e = err_of(first_result) { panic(e); }
+    guard let first = first_opt else { panic("sorted view omitted its first row"); }
+    assert(live_view_field_int(first, "score") == 1,
+           "sorted view returned the wrong first row");
+
+    let second_result = mongo.view_cursor_next(cursor, live_deadline());
+    guard let second_opt = second_result else let e = err_of(second_result) { panic(e); }
+    guard let second = second_opt else { panic("sorted view omitted its getMore row"); }
+    assert(live_view_field_int(second, "score") == 3,
+           "sorted view returned the wrong getMore row");
+    assert(live_view_field_int(first, "score") == 1,
+           "view from the prior batch did not retain its source bytes");
+
+    let exhausted = mongo.view_cursor_next(cursor, live_deadline());
+    guard let no_more = exhausted else let e = err_of(exhausted) { panic(e); }
+    if let _unexpected = no_more {
+        panic("sorted view returned more rows than its limit");
+    }
+    let closed = mongo.view_cursor_close(cursor, live_deadline());
+    guard let _closed = closed else let e = err_of(closed) { panic(e); }
+    println("PASS live sorted BSON view with getMore and retained document");
+}
+
 fn live_find_id(pool: mongo.Pool, collection: str, id: str) -> bool {
     let filter = mongo.document();
     live_put_string(filter, "_id", id);
@@ -198,6 +245,7 @@ fn run_live(uri: str, transactions: bool, collection: str) {
     live_insert_fixture(pool, collection, "red", 5, 3, true);
     live_insert_fixture(pool, collection, "blue", 0, 100, false);
     live_test_aggregation(pool, collection);
+    live_test_sorted_view(pool, collection);
     if transactions {
         live_test_transactions(pool, collection, to_str(time.mono()));
     }

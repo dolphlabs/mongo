@@ -15,6 +15,14 @@ guard let value = got else { panic("consumer lost id field"); }
 let number_result = mongo.as_int32(value);
 guard let number = number_result else let e = err_of(number_result) { panic(e); }
 assert(number == 42);
+let view_result = mongo.decode_view(raw);
+guard let view = view_result else let e = err_of(view_result) { panic(e); }
+let view_field_result = mongo.view_get(view, "id");
+guard let maybe_view_value = view_field_result else let e = err_of(view_field_result) { panic(e); }
+guard let view_value = maybe_view_value else { panic("consumer view lost id field"); }
+let view_number_result = mongo.view_as_int(view_value);
+guard let view_number = view_number_result else let e = err_of(view_number_result) { panic(e); }
+assert(view_number == 42);
 let srv_uri = mongo.parse_uri(
     "mongodb+srv://cluster.example.mongodb.net/app?tls=false");
 guard let srv_config = srv_uri else let e = err_of(srv_uri) { panic(e); }

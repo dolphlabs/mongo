@@ -637,6 +637,116 @@ fn test_mongo_aggregate_cursor_closes_early() {
     chan_recv(done);
 }
 
+fn mongo_test_view_server(listener: i32, done: chan[int]) {
+    let deadline = until_of(time.mono() + 5000000000);
+    let accepted = net.accept(listener);
+    guard let fd = accepted else let e = err_of(accepted) { panic(e); }
+    let cfg_result = new_config("127.0.0.1", 27017, "test");
+    guard let cfg = cfg_result else let e = err_of(cfg_result) { panic(e); }
+    let request_index = 0;
+    while request_index < 2 {
+        let header = mongo_test_read_exact(fd, 16, deadline);
+        let size = mongo_wire_read_i32(header, 0);
+        if size < 21 || size > DEFAULT_MAX_MESSAGE_BYTES {
+            panic("mock MongoDB view request has an invalid length");
+        }
+        let tail = mongo_test_read_exact(fd, size - 16, deadline);
+        let raw = header + tail;
+        let request_id = mongo_wire_read_i32(raw, 4);
+        let parsed = mongo_decode_op_msg(raw, 0, cfg);
+        guard let request = parsed else let e = err_of(parsed) { panic(e); }
+        if request_index == 0 {
+            assert(has_field(request.body, "find"), "view cursor sent the wrong initial command");
+        } else {
+            assert(has_field(request.body, "getMore"), "view cursor did not request its next batch");
+        }
+        let row = document();
+        mongo_operations_test_add(row, "seq", int64_value(request_index + 1));
+        mongo_operations_test_add(row, "payload", string_value("view payload"));
+        let rows: [Value] = [];
+        push(rows, document_value(row));
+        let cursor_reply = document();
+        if request_index == 0 {
+            mongo_operations_test_add(cursor_reply, "id", int64_value(42));
+            mongo_operations_test_add(cursor_reply, "firstBatch", array_value(rows));
+        } else {
+            mongo_operations_test_add(cursor_reply, "id", int64_value(0));
+            mongo_operations_test_add(cursor_reply, "nextBatch", array_value(rows));
+        }
+        mongo_operations_test_add(cursor_reply, "ns", string_value("test.users"));
+        let reply = document();
+        mongo_operations_test_add(reply, "ok", double_value(1.0));
+        mongo_operations_test_add(reply, "cursor", document_value(cursor_reply));
+        mongo_test_send_message(fd, request_id, reply, deadline);
+        request_index = request_index + 1;
+    }
+    net.close(fd);
+    net.close(listener);
+    chan_send(done, 1);
+}
+
+fn test_mongo_find_view_reads_first_and_next_batch() {
+    let listening = net.listen(0);
+    guard let listener = listening else let e = err_of(listening) { panic(e); }
+    let port_result = net.port(listener);
+    guard let port = port_result else let e = err_of(port_result) { panic(e); }
+    let done: chan[int] = make_chan(1);
+    spawn mongo_test_view_server(listener, done);
+    let deadline = until_of(time.mono() + 5000000000);
+    let config_result = new_config("127.0.0.1", port, "test");
+    guard let cfg = config_result else let e = err_of(config_result) { panic(e); }
+    let dialed = net.dial_until("127.0.0.1", port, deadline);
+    guard let fd = dialed else let e = err_of(dialed) { panic(e); }
+    let c = Conn {
+        config: cfg,
+        fd: fd,
+        ssl: nullptr,
+        tls: false,
+        next_request_id: 1,
+        lock: make_mutex(),
+        closed: false,
+        broken: false,
+        pool_managed: false,
+        pool_checked_out: false,
+        server_max_wire_version: 0,
+        is_writable_primary: false,
+        server_set_name: "",
+        logical_session_timeout_minutes: 0
+    };
+    let collection_result = collection(c, "users");
+    guard let col = collection_result else let e = err_of(collection_result) { panic(e); }
+    let options = default_find_options();
+    options.batch_size = 1;
+    let opened = find_view(col, document(), options, deadline);
+    guard let cur = opened else let e = err_of(opened) { panic(e); }
+    let first_result = view_cursor_next(cur, deadline);
+    guard let first_opt = first_result else let e = err_of(first_result) { panic(e); }
+    guard let first = first_opt else { panic("view cursor omitted its first document"); }
+    let first_seq_result = view_as_int(bson_view_test_field(first, "seq"));
+    guard let first_seq = first_seq_result else let e = err_of(first_seq_result) { panic(e); }
+    assert(first_seq == 1);
+    let first_payload = view_string_len(bson_view_test_field(first, "payload"));
+    guard let first_payload_len = first_payload else let e = err_of(first_payload) { panic(e); }
+    assert(first_payload_len == 12);
+
+    let second_result = view_cursor_next(cur, deadline);
+    guard let second_opt = second_result else let e = err_of(second_result) { panic(e); }
+    guard let second = second_opt else { panic("view cursor omitted its next batch"); }
+    let second_seq_result = view_as_int(bson_view_test_field(second, "seq"));
+    guard let second_seq = second_seq_result else let e = err_of(second_seq_result) { panic(e); }
+    assert(second_seq == 2);
+    let exhausted = view_cursor_next(cur, deadline);
+    guard let no_more = exhausted else let e = err_of(exhausted) { panic(e); }
+    if let _unexpected = no_more {
+        panic("view cursor returned data after its final batch");
+    }
+    let retained_result = view_as_int(bson_view_test_field(first, "seq"));
+    guard let retained = retained_result else let e = err_of(retained_result) { panic(e); }
+    assert(retained == 1, "cursor release invalidated a returned view");
+    close_conn(c);
+    chan_recv(done);
+}
+
 fn test_mongo_pool_aggregate_releases_empty_cursor() {
     let listening = net.listen(0);
     guard let listener = listening else let e = err_of(listening) { panic(e); }
