@@ -1,6 +1,6 @@
 # mongo — MongoDB driver for slang
 
-**Status:** Core driver, aggregation cursors, replica-set transactions, and the pinned live suite are implemented. Sorted-range decoding improved measurably, but its Go performance target remains open. A clean Git-pinned consumer install and release tag remain.
+**Status:** Core driver, aggregation cursors, replica-set transactions, and the pinned live suite are implemented. An opt-in validated BSON view improves sorted-range performance and memory use; matching Go remains open. A clean Git-pinned consumer install and release tag remain.
 **Repository:** `github.com/dolphlabs/mongo`
 **Import name:** `mongo`
 **Planned package path:** `src/mongo/`
@@ -61,7 +61,8 @@ run sequentially on a given Session.
    result.
 5. **Live interoperability — implemented for MongoDB 8.2.12:**
    `tests/live/run.sh` builds temporary TLS/SCRAM and one-node replica-set
-   servers. It passed verified TLS, authentication, aggregation with a second
+   servers. It passed verified TLS, authentication, sorted BSON view reads
+   across `getMore` with retained-document access, aggregation with a second
    batch, transaction commit, and abort/rollback on 2026-10-11. Other server
    versions and Atlas itself have not been qualified.
 6. **Cluster connectivity — initial discovery implemented:** `mongodb+srv`
@@ -82,6 +83,18 @@ run sequentially on a given Session.
    to 32.02 billion. The local Mac/Docker result is diagnostic, not a cloud
    server benchmark. The optimization is substantial but does not meet the
    original 98%-of-Go throughput and 1.02x-Go p99 goal.
+8. **Selective BSON views measured (2026-10-11):** added a `DocumentView` API
+   and view cursor that fully validates each OP_MSG BSON body, then reads
+   selected fields without materializing the dynamic BSON tree. The sorted-range
+   harness compared dynamic slang, view slang, and Go in eight samples per path
+   at each worker count, in ABBA order. Every request checked all 50 returned
+   records; all 48 samples completed without errors. At 16 workers, the view
+   reached 1,610.5 requests/s versus 1,031 for dynamic slang and 2,861.5 for Go.
+   View p99 was 32.10 ms versus 42.88 ms dynamic and 12.19 ms Go. RSS was
+   18.66 MiB versus 50.50 MiB dynamic and 15.98 MiB Go; retired instructions
+   were 20.13B versus 32.09B dynamic and 5.77B Go. This read-only local
+   Mac/Docker result is diagnostic, not a cloud benchmark. Raw samples are in
+   `bench/range/results_20261011_mac.jsonl`.
 
 ## Current API and remaining work
 
@@ -91,6 +104,14 @@ run sequentially on a given Session.
 keeps batches bounded, sends `getMore` as needed, and can kill a live cursor
 when closed early.
 
+`find_view` and `pool_find_view` provide the same sorted find operation with
+`ViewCursor` and `DocumentView` results. The view path validates the full BSON
+reply, including unused fields, then avoids constructing a `Value` for every
+field. `view_string_len` reads string length without creating a slang string;
+`view_as_string` creates one when the caller needs text. Views retain the
+response bytes that back them. Cursor advancement releases exhausted batches
+unless the caller still holds a document or value view from that batch.
+
 `start_session` and `pool_start_session` create sessions. `session_collection`
 and `session_command` attach the session id to commands. Transactions use
 `begin_transaction`, `commit_transaction`, and `abort_transaction`, followed by
@@ -99,26 +120,26 @@ are restricted to a writable primary in a replica set. The API does not retry
 ambiguous commits automatically; returned errors preserve MongoDB error labels
 so callers can decide whether to retry commit with the same Session.
 
-The next performance task is further reducing the remaining sorted-range cost.
-The current implementation validates incoming UTF-8 once, stores ordinary
-BSON strings as slang strings, and reuses decoded batch arrays rather than
-copying them. The table reports medians over eight read-only samples per build
-and worker count; each request checks 50 returned documents.
+The dynamic decoder remains the default and retains its existing API. The view
+cursor is opt-in for field-selective reads. The table reports medians over
+eight read-only samples per path and worker count; each request checks 50
+returned documents.
 
-| Workers | Build | Requests/s | p50 (ms) | p99 (ms) | RSS (MiB) | Retired instructions (B) |
+| Workers | Path | Requests/s | p50 (ms) | p99 (ms) | RSS (MiB) | Retired instructions (B) |
 |---:|---|---:|---:|---:|---:|---:|
-| 1 | Before | 225.5 | 4.371 | 5.618 | 18.78 | 3.60 |
-| 1 | Current slang | 351.0 | 2.757 | 3.780 | 12.02 | 2.00 |
-| 1 | Go | 953.5 | 0.993 | 1.756 | 13.28 | 0.35 |
-| 16 | Before | 685.0 | 19.377 | 56.034 | 63.52 | 58.23 |
-| 16 | Current slang | 1,082.5 | 11.501 | 42.473 | 48.98 | 32.02 |
-| 16 | Go | 2,762.5 | 5.224 | 12.757 | 16.42 | 5.76 |
+| 1 | Dynamic slang | 352.5 | 2.787 | 3.361 | 11.90 | 2.00 |
+| 1 | BSON view slang | 526.0 | 1.862 | 2.481 | 6.26 | 1.29 |
+| 1 | Go | 938.5 | 0.998 | 1.575 | 13.20 | 0.35 |
+| 16 | Dynamic slang | 1,031.0 | 12.755 | 42.883 | 50.50 | 32.09 |
+| 16 | BSON view slang | 1,610.5 | 7.783 | 32.102 | 18.66 | 20.13 |
+| 16 | Go | 2,861.5 | 5.008 | 12.190 | 15.98 | 5.77 |
 
-At 16 workers the change improved throughput 58%, p99 24%, RSS 23%, and retired
-instructions 45% against the pre-change decoder. It reaches 39% of Go
-throughput and has 3.3x Go p99. At one worker it reaches 37% of Go throughput
-with 2.2x Go p99. Do not claim parity until a new measured change closes that
-gap without increasing memory unsafely.
+At 16 workers, the view improved throughput 56%, p99 25%, RSS 63%, and retired
+instructions 37% against the dynamic decoder. It reaches 56% of Go throughput
+and has 2.63x Go p99. At one worker, it reaches 56% of Go throughput and has
+1.57x Go p99. The current dynamic path remains at 36% of Go throughput and
+3.52x Go p99 at 16 workers. Do not claim parity until another measured change
+closes the remaining gap without increasing memory unsafely.
 
 Release work remains: run a clean Git-pinned consumer install after publishing
 the source branch, qualify any additional MongoDB versions before claiming

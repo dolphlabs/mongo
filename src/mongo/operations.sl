@@ -85,14 +85,26 @@ pub fn insert_many(col: Collection, docs: [Document], ordered: bool,
 
 pub fn find(col: Collection, filter: Document, options: FindOptions,
             deadline: until) -> result[Cursor, str] {
-    let valid_collection = mongo_validate_collection(col.name);
+    let command_result = mongo_build_find_command(col.name, filter, options);
+    guard let command_doc = command_result else let e = err_of(command_result) {
+        return err(e);
+    }
+    let reply = mongo_collection_command(col, command_doc, deadline);
+    guard let response = reply else let e = err_of(reply) { return err(e); }
+    return mongo_cursor_from_reply(col, response, options.batch_size,
+                                   "find", deadline);
+}
+
+fn mongo_build_find_command(collection_name: str, filter: Document,
+                            options: FindOptions) -> result[Document, str] {
+    let valid_collection = mongo_validate_collection(collection_name);
     guard let _collection = valid_collection else let e = err_of(valid_collection) {
         return err(e);
     }
     let valid = mongo_validate_find_options(options);
     guard let _valid = valid else let e = err_of(valid) { return err(e); }
     let command_doc = document();
-    let found = mongo_put_string(command_doc, "find", col.name);
+    let found = mongo_put_string(command_doc, "find", collection_name);
     guard let _found = found else let e = err_of(found) { return err(e); }
     let filter_added = put(command_doc, "filter", document_value(filter));
     guard let _filter = filter_added else let e = err_of(filter_added) { return err(e); }
@@ -119,10 +131,7 @@ pub fn find(col: Collection, filter: Document, options: FindOptions,
         let added = put(command_doc, "sort", document_value(sort_doc));
         guard let _added = added else let e = err_of(added) { return err(e); }
     }
-    let reply = mongo_collection_command(col, command_doc, deadline);
-    guard let response = reply else let e = err_of(reply) { return err(e); }
-    return mongo_cursor_from_reply(col, response, options.batch_size,
-                                   "find", deadline);
+    return ok(command_doc);
 }
 
 pub fn aggregate(col: Collection, pipeline: [Document], batch_size: int,

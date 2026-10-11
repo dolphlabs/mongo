@@ -180,11 +180,25 @@ The in-memory BSON codec benchmark compares this package with the official Go
 MongoDB BSON codec v1.17.10 on the same document and host. Run
 `bench/bson/run.sh` with a compiler containing the binary64 encoding helpers.
 The output includes a hash of each encoded fixture to confirm wire parity.
-That codec benchmark measures serialization cost only. The sorted-range
-client comparison and its measured limits are recorded in
-[`MONGO_DRIVER_PRD.md`](MONGO_DRIVER_PRD.md); it is a local Mac/Docker diagnostic,
-not a cloud service benchmark. The current decoder is still slower than Go on
-that workload, despite the reduction in allocation, instructions, and RSS.
+That codec benchmark measures serialization cost only.
+
+For sorted reads that inspect only a few fields, `pool_find_view` and
+`find_view` return a `ViewCursor` whose `view_cursor_next` yields validated
+`DocumentView` values instead of building a complete `Document`/`Value` tree.
+Use `view_get` followed by a typed accessor such as `view_as_int` or
+`view_string_len`. `view_as_string` materializes a slang string; a view and any
+binary slice retain their source response batch. Advancing the cursor releases
+its reference to the exhausted batch, while application-held views keep it
+alive. The existing dynamic `find` and `pool_find` APIs are unchanged.
+
+The read-only sorted-range comparison measures dynamic slang, view slang, and
+the official Go driver against one local MongoDB dataset. Run it with
+`sh bench/range/run.sh`; its latest results and limits are recorded in
+[`MONGO_DRIVER_PRD.md`](MONGO_DRIVER_PRD.md). These Mac/Docker numbers are a
+controlled local diagnostic, not a cloud server benchmark. The BSON view
+improves throughput, p99, memory, and instructions over dynamic decoding, but
+does not yet match Go. The 48 raw samples are kept in
+`bench/range/results_20261011_mac.jsonl`.
 
 ## Design notes
 

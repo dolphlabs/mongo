@@ -27,6 +27,12 @@ struct OpMessage {
     body: Document,
 }
 
+struct OpFrame {
+    request_id: int,
+    header: bytes,
+    tail: bytes,
+}
+
 pub fn usable(c: Conn) -> bool {
     return !c.closed && !c.broken;
 }
@@ -52,6 +58,64 @@ pub fn command_on(c: Conn, database: str, body: Document, deadline: until)
 
 fn mongo_command_locked(c: Conn, database: str, body: Document,
                         deadline: until) -> result[Document, str] {
+    let frame_result = mongo_command_exchange_locked(c, database, body,
+                                                      deadline);
+    guard let frame = frame_result else let e = err_of(frame_result) {
+        return err(e);
+    }
+    let full = builder.new_bytes();
+    full.write(frame.header);
+    full.write(frame.tail);
+    let response_raw = full.finish();
+    let decoded = mongo_decode_op_msg(response_raw, frame.request_id, c.config);
+    guard let response = decoded else let e = err_of(decoded) {
+        mongo_break_connection(c);
+        return err(e);
+    }
+    let status = mongo_check_command_status(response.body);
+    guard let _ok = status else let e = err_of(status) {
+        if strings.has_prefix(e, "mongo.command protocol:") {
+            mongo_break_connection(c);
+        }
+        return err(e);
+    }
+    return ok(response.body);
+}
+
+fn mongo_command_view_on(c: Conn, database: str, body: Document,
+                         deadline: until) -> result[DocumentView, str] {
+    mutex_lock(c.lock);
+    let view_result = mongo_command_view_locked(c, database, body, deadline);
+    mutex_unlock(c.lock);
+    return view_result;
+}
+
+fn mongo_command_view_locked(c: Conn, database: str, body: Document,
+                             deadline: until)
+                            -> result[DocumentView, str] {
+    let frame_result = mongo_command_exchange_locked(c, database, body,
+                                                      deadline);
+    guard let frame = frame_result else let e = err_of(frame_result) {
+        return err(e);
+    }
+    let decoded = mongo_decode_op_msg_view(frame.header, frame.tail,
+                                           frame.request_id, c.config);
+    guard let response = decoded else let e = err_of(decoded) {
+        mongo_break_connection(c);
+        return err(e);
+    }
+    let status = mongo_check_command_status_view(response);
+    guard let _ok = status else let e = err_of(status) {
+        if strings.has_prefix(e, "mongo.command protocol:") {
+            mongo_break_connection(c);
+        }
+        return err(e);
+    }
+    return ok(response);
+}
+
+fn mongo_command_exchange_locked(c: Conn, database: str, body: Document,
+                                 deadline: until) -> result[OpFrame, str] {
     if c.closed || c.broken {
         return err("mongo.command: connection is closed or broken");
     }
@@ -99,23 +163,11 @@ fn mongo_command_locked(c: Conn, database: str, body: Document,
         mongo_break_connection(c);
         return err("mongo.command: response body read failed: " + e);
     }
-    let full = builder.new_bytes();
-    full.write(header_bytes);
-    full.write(tail);
-    let response_raw = full.finish();
-    let decoded = mongo_decode_op_msg(response_raw, request_id, c.config);
-    guard let response = decoded else let e = err_of(decoded) {
-        mongo_break_connection(c);
-        return err(e);
-    }
-    let status = mongo_check_command_status(response.body);
-    guard let _ok = status else let e = err_of(status) {
-        if strings.has_prefix(e, "mongo.command protocol:") {
-            mongo_break_connection(c);
-        }
-        return err(e);
-    }
-    return ok(response.body);
+    return ok(OpFrame {
+        request_id: request_id,
+        header: header_bytes,
+        tail: tail
+    });
 }
 
 fn mongo_add_database(source: Document, database: str)
@@ -213,6 +265,42 @@ fn mongo_decode_op_msg(raw: bytes, expected_response_to: int, config: Config)
     });
 }
 
+fn mongo_decode_op_msg_view(header: bytes, tail: bytes,
+                            expected_response_to: int, config: Config)
+                           -> result[DocumentView, str] {
+    if len(header) != 16 || len(tail) < 5 ||
+       len(header) + len(tail) > config.max_message_bytes {
+        return err("mongo.command protocol: response size is outside configured bounds");
+    }
+    let message_length = mongo_wire_read_i32(header, 0);
+    if message_length != len(header) + len(tail) {
+        return err("mongo.command protocol: declared message length does not match received bytes");
+    }
+    if mongo_wire_read_i32(header, 12) != OP_MSG {
+        return err("mongo.command protocol: expected OP_MSG response");
+    }
+    if mongo_wire_read_i32(header, 8) != expected_response_to {
+        return err("mongo.command protocol: responseTo does not match request id");
+    }
+    if mongo_wire_read_i32(tail, 0) != 0 {
+        return err("mongo.command protocol: unsupported OP_MSG flags");
+    }
+    if tail[4] != 0 {
+        return err("mongo.command protocol: only a single body section is supported");
+    }
+    let bson_length = mongo_wire_read_i32(tail, 5);
+    if bson_length < 5 || bson_length > config.max_bson_bytes ||
+       bson_length != len(tail) - 5 {
+        return err("mongo.command protocol: invalid or oversized BSON body length");
+    }
+    let bounds = new_limits(config.max_bson_bytes, DEFAULT_MAX_BSON_DEPTH,
+                            DEFAULT_MAX_BSON_VALUES);
+    guard let limits = bounds else let e = err_of(bounds) {
+        return err("mongo.command protocol: invalid BSON limit: " + e);
+    }
+    return bson_view_decode_at(tail, 5, bson_length, limits);
+}
+
 fn mongo_check_command_status(body: Document) -> result[bool, str] {
     let found = get(body, "ok");
     guard let status = found else {
@@ -251,6 +339,118 @@ fn mongo_check_command_status(body: Document) -> result[bool, str] {
     let labels = mongo_command_error_labels(body);
     guard let label_text = labels else let e = err_of(labels) { return err(e); }
     return err("mongo command failed" + code_text + label_text + ": " + message);
+}
+
+fn mongo_check_command_status_view(body: DocumentView)
+                                   -> result[bool, str] {
+    let found = view_get(body, "ok");
+    guard let status_opt = found else let e = err_of(found) { return err(e); }
+    guard let status = status_opt else {
+        return err("mongo.command protocol: response has no ok field");
+    }
+    let successful = false;
+    if view_kind(status) == BSON_DOUBLE {
+        let number_result = view_as_double(status);
+        guard let number = number_result else let e = err_of(number_result) {
+            return err("mongo.command protocol: invalid ok field: " + e);
+        }
+        successful = number != 0.0;
+    } else if view_kind(status) == BSON_INT32 || view_kind(status) == BSON_INT64 {
+        let number_result = view_as_int(status);
+        guard let number = number_result else let e = err_of(number_result) {
+            return err("mongo.command protocol: invalid ok field: " + e);
+        }
+        successful = number != 0;
+    } else {
+        return err("mongo.command protocol: response ok field is not numeric");
+    }
+    if successful {
+        return ok(true);
+    }
+
+    let message = "command failed";
+    let details = view_get(body, "errmsg");
+    guard let details_opt = details else let e = err_of(details) { return err(e); }
+    if let error_value = details_opt {
+        let error_text = view_as_string(error_value);
+        guard let text = error_text else {
+            return err("mongo.command protocol: errmsg is not a string");
+        }
+        message = text;
+        if len(message) > 1024 {
+            message = strings.slice(message, 0, 1024);
+        }
+    }
+    let code_text = "";
+    let code_field = view_get(body, "code");
+    guard let code_opt = code_field else let e = err_of(code_field) { return err(e); }
+    if let code_value = code_opt {
+        if view_kind(code_value) == BSON_INT32 ||
+           view_kind(code_value) == BSON_INT64 {
+            let code_result = view_as_int(code_value);
+            guard let code = code_result else let e = err_of(code_result) {
+                return err("mongo.command protocol: invalid code: " + e);
+            }
+            code_text = " [" + to_str(code) + "]";
+        }
+    }
+    let labels = mongo_command_error_labels_view(body);
+    guard let label_text = labels else let e = err_of(labels) { return err(e); }
+    return err("mongo command failed" + code_text + label_text + ": " + message);
+}
+
+fn mongo_command_error_labels_view(body: DocumentView) -> result[str, str] {
+    let field = view_get(body, "errorLabels");
+    guard let value_opt = field else let e = err_of(field) { return err(e); }
+    guard let value = value_opt else { return ok(""); }
+    if view_kind(value) != BSON_ARRAY {
+        return err("mongo.command protocol: errorLabels is not an array");
+    }
+    let raw = bson_value_view_raw(value);
+    let pos = bson_value_view_start(value) + 4;
+    let end = bson_value_view_end(value) - 1;
+    let out = "";
+    let index = 0;
+    while pos < end {
+        if index >= 16 {
+            return err("mongo.command protocol: too many error labels");
+        }
+        if raw[pos] != BSON_STRING {
+            return err("mongo.command protocol: error label is not a string");
+        }
+        let key_end_result = bson_view_cstring_end(raw, pos + 1, end);
+        guard let key_end = key_end_result else let e = err_of(key_end_result) {
+            return err("mongo.command protocol: invalid error label index: " + e);
+        }
+        if !bson_view_index_matches(raw, pos + 1, key_end, index) {
+            return err("mongo.command protocol: error label array index is invalid");
+        }
+        let value_start = key_end + 1;
+        let value_end_result = bson_view_value_end(raw, value_start, end,
+                                                    BSON_STRING);
+        guard let value_end = value_end_result else let e = err_of(value_end_result) {
+            return err("mongo.command protocol: invalid error label: " + e);
+        }
+        let label_result = view_as_string(
+            bson_view_make_value(raw, BSON_STRING, value_start, value_end));
+        guard let label = label_result else let e = err_of(label_result) {
+            return err("mongo.command protocol: invalid error label: " + e);
+        }
+        if label == "" || len(label) > 64 {
+            return err("mongo.command protocol: error label length is invalid");
+        }
+        if index == 0 {
+            out = " [errorLabels=" + label;
+        } else {
+            out = out + "," + label;
+        }
+        pos = value_end;
+        index = index + 1;
+    }
+    if index > 0 {
+        out = out + "]";
+    }
+    return ok(out);
 }
 
 fn mongo_command_error_labels(body: Document) -> result[str, str] {
