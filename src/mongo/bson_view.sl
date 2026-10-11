@@ -16,10 +16,15 @@ gc struct BsonValueViewData {
     end: int
 }
 
+// A read-only handle to a validated BSON document backed by its original
+// bytes. Copying the view does not copy the document. Do not mutate the source
+// bytes while this view or one of its values is in use.
 pub struct DocumentView {
     inner: BsonDocumentViewData
 }
 
+// A read-only handle to a BSON value range backed by its document's original
+// bytes. Keeping the view alive keeps those bytes alive; do not mutate them.
 pub struct ValueView {
     inner: BsonValueViewData
 }
@@ -40,12 +45,18 @@ gc struct BsonViewFrame {
     keys: [BsonViewKey]
 }
 
-// decode_view validates one complete BSON document and retains raw as its
-// backing storage. It validates all values, including fields never accessed.
+// A view of one complete BSON document, or an error if the input is malformed
+// or exceeds `default_limits()`. Every value is validated, including fields
+// never accessed. The view retains `raw` without copying its BSON bytes; do
+// not mutate `raw` while this view or a derived value view is in use.
 pub fn decode_view(raw: bytes) -> result[DocumentView, str] {
     return decode_view_with_limits(raw, default_limits());
 }
 
+// A view of one complete BSON document under `limits`, or an error if the
+// input or limits are invalid. Every value is validated, including fields
+// never accessed. The view retains `raw` without copying its BSON bytes; do
+// not mutate `raw` while this view or a derived value view is in use.
 pub fn decode_view_with_limits(raw: bytes, limits: Limits)
                                -> result[DocumentView, str] {
     if !bson_limits_valid(limits) {
@@ -400,6 +411,9 @@ fn bson_view_skip_scalar(raw: bytes, pos: int, end: int, kind: int)
     return err("bson.decode_view: unsupported BSON type tag " + to_str(kind));
 }
 
+// The field named `key`, or `ok(none)` when it is absent. Invalid views and
+// keys containing NUL or invalid UTF-8 return an error. BSON duplicate keys
+// are rejected when the view is created.
 pub fn view_get(doc: DocumentView, key: str) -> result[opt[ValueView], str] {
     let raw = bson_view_raw(doc);
     let start = bson_view_start(doc);
@@ -545,10 +559,13 @@ fn bson_view_value_end_trusted(raw: bytes, pos: int, end: int, kind: int)
     return err("unsupported BSON type tag " + to_str(kind));
 }
 
+// The BSON wire type tag for `value`; compare it with the `BSON_*` constants.
 pub fn view_kind(value: ValueView) -> int {
     return bson_value_view_kind(value);
 }
 
+// The value as `int` when it is BSON Int32, Int64, or DateTime milliseconds.
+// Other types return an error; no numeric coercion is performed.
 pub fn view_as_int(value: ValueView) -> result[int, str] {
     let raw = bson_value_view_raw(value);
     let kind = bson_value_view_kind(value);
@@ -569,6 +586,8 @@ pub fn view_as_int(value: ValueView) -> result[int, str] {
     return err("bson.view_as_int: value is not a BSON integer or date");
 }
 
+// The value as `bool` when it is a valid BSON Boolean; other types return an
+// error.
 pub fn view_as_bool(value: ValueView) -> result[bool, str] {
     let raw = bson_value_view_raw(value);
     let pos = bson_value_view_start(value);
@@ -582,6 +601,8 @@ pub fn view_as_bool(value: ValueView) -> result[bool, str] {
     return ok(raw[pos] == 1);
 }
 
+// The value as an IEEE-754 `float` when it is BSON Double; other types return
+// an error.
 pub fn view_as_double(value: ValueView) -> result[float, str] {
     let raw = bson_value_view_raw(value);
     let pos = bson_value_view_start(value);
@@ -595,6 +616,9 @@ pub fn view_as_double(value: ValueView) -> result[float, str] {
     return encoding.float64_from_le(raw[pos..pos + 8]);
 }
 
+// The UTF-8 byte length of a BSON string, excluding its trailing NUL. Other
+// types return an error. This reads the length without allocating a slang
+// `str`.
 pub fn view_string_len(value: ValueView) -> result[int, str] {
     let raw = bson_value_view_raw(value);
     let pos = bson_value_view_start(value);
@@ -613,6 +637,10 @@ pub fn view_string_len(value: ValueView) -> result[int, str] {
     return ok(size - 1);
 }
 
+// The value as a newly materialized slang `str` when it is a BSON string.
+// Strings containing U+0000 return an error because slang `str` is
+// NUL-terminated; use `view_string_len` when only the encoded byte length is
+// needed.
 pub fn view_as_string(value: ValueView) -> result[str, str] {
     let raw = bson_value_view_raw(value);
     let pos = bson_value_view_start(value);
@@ -623,13 +651,15 @@ pub fn view_as_string(value: ValueView) -> result[str, str] {
     let i = start;
     while i < start + size {
         if raw[i] == 0 {
-            return err("bson.view_as_string: BSON string contains U+0000; use a byte view");
+            return err("bson.view_as_string: BSON string contains U+0000; use decode and as_string_bytes");
         }
         i = i + 1;
     }
     return ok(strings.from_bytes(raw, start, start + size));
 }
 
+// A nested `DocumentView` when the value is a BSON document. BSON arrays and
+// all other types return an error.
 pub fn view_as_document(value: ValueView) -> result[DocumentView, str] {
     let raw = bson_value_view_raw(value);
     let start = bson_value_view_start(value);
@@ -644,6 +674,8 @@ pub fn view_as_document(value: ValueView) -> result[DocumentView, str] {
     return ok(bson_view_make_document(raw, start, end));
 }
 
+// A copy of the BSON binary payload, without its subtype byte. Legacy subtype
+// 2's inner length prefix is removed. The subtype is not returned by this API.
 pub fn view_as_binary(value: ValueView) -> result[bytes, str] {
     let raw = bson_value_view_raw(value);
     let pos = bson_value_view_start(value);

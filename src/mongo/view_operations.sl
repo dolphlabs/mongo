@@ -1,5 +1,9 @@
 import "strings";
 
+// A cursor that yields validated `DocumentView` values. It retains its
+// connection; a pooled cursor keeps that pool slot checked out while live.
+// Exhaust or close it to release cursor resources. Returned views keep their
+// own reference to the batch bytes they use.
 pub gc struct ViewCursor {
     connection: Conn,
     pool: opt[Pool],
@@ -15,6 +19,9 @@ pub gc struct ViewCursor {
     closed: bool,
 }
 
+// A cursor over matching documents without constructing a dynamic BSON tree.
+// Each response batch is fully validated before any view is returned. Close
+// the cursor if iteration stops before it is exhausted.
 pub fn find_view(col: Collection, filter: Document, options: FindOptions,
                  deadline: until) -> result[ViewCursor, str] {
     let command = mongo_build_find_command(col.name, filter, options);
@@ -30,6 +37,9 @@ pub fn find_view(col: Collection, filter: Document, options: FindOptions,
     return ok(cur);
 }
 
+// A pooled cursor over matching documents without constructing a dynamic BSON
+// tree. The pool connection remains checked out until exhaustion or close.
+// Each response batch is fully validated before any view is returned.
 pub fn pool_find_view(p: Pool, collection_name: str, filter: Document,
                       options: FindOptions, deadline: until)
                      -> result[ViewCursor, str] {
@@ -53,6 +63,11 @@ pub fn pool_find_view(p: Pool, collection_name: str, filter: Document,
     return ok(cur);
 }
 
+// The next document as `ok(some(view))`, or `ok(none)` at end of results.
+// When needed, this fetches another batch using `deadline`. End of results
+// releases the cursor's batch reference and pooled connection; returned views
+// continue to retain the batches they reference. Fetch or validation errors
+// close the cursor before returning.
 pub fn view_cursor_next(cur: ViewCursor, deadline: until)
                          -> result[opt[DocumentView], str] {
     if cur.closed {
@@ -119,6 +134,9 @@ pub fn view_cursor_next(cur: ViewCursor, deadline: until)
     }
 }
 
+// `ok(true)` after closing and releasing the batch and any pooled connection.
+// Sends `killCursors` when the cursor is live; closing an exhausted or already
+// closed cursor succeeds without sending a command.
 pub fn view_cursor_close(cur: ViewCursor, deadline: until)
                          -> result[bool, str] {
     if cur.closed || cur.id == 0 {

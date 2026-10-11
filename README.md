@@ -182,14 +182,101 @@ MongoDB BSON codec v1.17.10 on the same document and host. Run
 The output includes a hash of each encoded fixture to confirm wire parity.
 That codec benchmark measures serialization cost only.
 
-For sorted reads that inspect only a few fields, `pool_find_view` and
-`find_view` return a `ViewCursor` whose `view_cursor_next` yields validated
-`DocumentView` values instead of building a complete `Document`/`Value` tree.
-Use `view_get` followed by a typed accessor such as `view_as_int` or
-`view_string_len`. `view_as_string` materializes a slang string; a view and any
-binary slice retain their source response batch. Advancing the cursor releases
-its reference to the exhausted batch, while application-held views keep it
-alive. The existing dynamic `find` and `pool_find` APIs are unchanged.
+## BSON views
+
+Use the opt-in view API when a query returns large documents but the
+application reads only a few fields. `find_view` and `pool_find_view` return a
+`ViewCursor`; `view_cursor_next` yields each result as a `DocumentView` without
+building the full dynamic `Document`/`Value` tree. Existing `find`,
+`pool_find`, `decode`, and `Document` APIs are unchanged.
+
+This example reads a sorted range through a direct connection:
+
+```slang
+import "mongo";
+import "time";
+
+let deadline = until_of(time.mono() + 5_000_000_000);
+let connected = mongo.connect("mongodb://127.0.0.1:27017/app", deadline);
+guard let db = connected else let e = err_of(connected) { panic(e); }
+let collection_result = mongo.collection(db, "events");
+guard let events = collection_result else let e = err_of(collection_result) {
+    panic(e);
+}
+
+let filter = mongo.document();
+let sort = mongo.document();
+let ascending = mongo.int32_value(1);
+guard let one = ascending else let e = err_of(ascending) { panic(e); }
+let sort_added = mongo.put(sort, "score", one);
+guard let _sort_added = sort_added else let e = err_of(sort_added) {
+    panic(e);
+}
+let options = mongo.default_find_options();
+options.sort = some(sort);
+options.limit = 100;
+options.batch_size = 50;
+
+let opened = mongo.find_view(events, filter, options, deadline);
+guard let cursor = opened else let e = err_of(opened) { panic(e); }
+while true {
+    let next = mongo.view_cursor_next(cursor, deadline);
+    guard let maybe_event = next else let e = err_of(next) { panic(e); }
+    guard let event = maybe_event else { break; }
+
+    let field = mongo.view_get(event, "score");
+    guard let maybe_score = field else let e = err_of(field) { panic(e); }
+    if let score_view = maybe_score {
+        let score_result = mongo.view_as_int(score_view);
+        guard let score = score_result else let e = err_of(score_result) {
+            panic(e);
+        }
+        println(score);
+    }
+}
+let closed = mongo.view_cursor_close(cursor, deadline);
+guard let _closed = closed else let e = err_of(closed) { panic(e); }
+mongo.close_conn(db);
+```
+
+Use `pool_find_view(pool, collection_name, filter, options, deadline)` for a
+pooled query. Its connection stays checked out until the cursor reaches the
+end or `view_cursor_close` succeeds. Always close early-stopped cursors; a
+cursor in a session must also be exhausted or closed before the session is
+committed, aborted, or ended.
+
+`view_get(document, key)` returns `ok(some(value))` when the field exists and
+`ok(none)` when it does not. It returns an error for an invalid key or view.
+`view_kind` returns the BSON tag, which can be compared with a `BSON_*`
+constant. Typed accessors do not coerce: `view_as_int` accepts Int32, Int64,
+and DateTime; `view_as_bool` accepts Boolean; `view_as_double` accepts Double;
+`view_as_document` accepts a nested document but not an array. For strings,
+`view_string_len` returns the UTF-8 byte count without creating a `str`, while
+`view_as_string` allocates a slang string. A BSON string containing U+0000
+cannot be represented as `str`; use the full `decode` path and
+`as_string_bytes` when those exact bytes are needed. `view_as_binary` copies
+the binary payload into `bytes`, removes the legacy subtype 2 length prefix,
+and does not return the binary subtype. This view API has no typed accessors
+for arrays, ObjectIds, Decimal128, timestamps, or regex values; use the
+dynamic BSON API when those values must be read.
+
+`decode_view(raw)` and `decode_view_with_limits(raw, limits)` create a view
+from one standalone BSON document. The default limits are 16 MiB per document,
+100 nested levels, and 100,000 values. View construction validates the whole
+document—including fields the caller never reads, duplicate keys, UTF-8, and
+array indexes—before returning. It retains the input `bytes` without copying;
+do not mutate the input while the document or any derived `ValueView` is in
+use.
+
+Network cursors apply the connection's BSON and message limits and validate
+each complete response batch before exposing a document. A `DocumentView` or
+`ValueView` keeps its entire source response batch alive, not just the selected
+field. Advancing past a batch releases the cursor's reference to it, but any
+views your application still holds keep it alive. A string returned by
+`view_as_string` and bytes returned by `view_as_binary` are independent copies.
+Each `view_get` scans fields from the start of the document, so this path is
+best when you inspect a small number of fields rather than many fields or a
+whole document.
 
 The read-only sorted-range comparison measures dynamic slang, view slang, and
 the official Go driver against one local MongoDB dataset. Run it with

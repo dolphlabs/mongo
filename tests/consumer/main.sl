@@ -49,3 +49,33 @@ fn compile_client_api(uri: str, deadline: until) -> result[bool, str] {
     mongo.close_conn(db);
     return ok(true);
 }
+
+fn compile_view_cursor_api(col: mongo.Collection, deadline: until)
+                           -> result[bool, str] {
+    let filter = mongo.document();
+    let options = mongo.default_find_options();
+    let opened = mongo.find_view(col, filter, options, deadline);
+    guard let cursor = opened else let e = err_of(opened) { return err(e); }
+    let next = mongo.view_cursor_next(cursor, deadline);
+    guard let maybe_doc = next else let e = err_of(next) {
+        let ignored = mongo.view_cursor_close(cursor, deadline);
+        return err(e);
+    }
+    if let doc = maybe_doc {
+        let field = mongo.view_get(doc, "score");
+        guard let maybe_score = field else let e = err_of(field) {
+            let ignored = mongo.view_cursor_close(cursor, deadline);
+            return err(e);
+        }
+        if let score_view = maybe_score {
+            let score = mongo.view_as_int(score_view);
+            guard let _score = score else let e = err_of(score) {
+                let ignored = mongo.view_cursor_close(cursor, deadline);
+                return err(e);
+            }
+        }
+    }
+    let closed = mongo.view_cursor_close(cursor, deadline);
+    guard let _closed = closed else let e = err_of(closed) { return err(e); }
+    return ok(true);
+}

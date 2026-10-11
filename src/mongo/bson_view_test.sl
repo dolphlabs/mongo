@@ -72,6 +72,7 @@ fn test_bson_view_checks_types_and_nul_strings() {
     let nul_text = view_as_string(nul_field);
     guard let _text = nul_text else let e = err_of(nul_text) {
         assert(strings.contains(e, "U+0000"), e);
+        assert(strings.contains(e, "decode and as_string_bytes"), e);
         return;
     }
     panic("BSON view converted a NUL-containing string to slang str");
