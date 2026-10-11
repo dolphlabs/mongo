@@ -1,6 +1,6 @@
 # mongo — MongoDB driver for slang
 
-**Status:** Scope approved; initial implementation is in place. Live-server compatibility and release gates remain.
+**Status:** Core driver, aggregation cursors, replica-set transactions, and the pinned live suite are implemented. Sorted-range decoding improved measurably, but its Go performance target remains open. A clean Git-pinned consumer install and release tag remain.
 **Repository:** `github.com/dolphlabs/mongo`
 **Import name:** `mongo`
 **Planned package path:** `src/mongo/`
@@ -27,14 +27,15 @@ There is no existing BSON package, dynamic JSON value model, MongoDB protocol im
 - Add common collection operations and cursor handling at the agreed initial scope.
 - Test hostile and malformed protocol input with scripted fake servers; keep live-server tests opt-in.
 
-## Non-goals for the first milestone
+## Deliberate limits
 
-Transactions, change streams, load-balanced mode, sharded-cluster routing, automatic retryable writes, and a complete aggregation-builder DSL are excluded unless selected as launch requirements. A raw command API can expose server features without a driver-specific builder for each one.
-
-The first release targets one direct `mongodb://` host. Replica-set discovery,
-multiple seed hosts, and `mongodb+srv://` are deferred. The initial operation
-surface includes raw commands, common insert/find/update/delete helpers,
-cursors, and a bounded connection pool.
+The package exposes MongoDB pipeline stages as BSON documents instead of adding
+a fluent aggregation DSL. It supports explicit replica-set sessions and
+transactions, but does not route sharded transactions through `mongos`. Direct
+connections and initial `mongodb+srv://` seed discovery are supported; ongoing
+topology monitoring, failover recovery, automatic retryable writes, change
+streams, and load-balanced mode remain out of scope. Session operations must
+run sequentially on a given Session.
 
 ## Proposed architecture
 
@@ -51,68 +52,78 @@ cursors, and a bounded connection pool.
 1. **Package foundation and BSON — implemented:** metadata, dynamic BSON API, bounded encoder/decoder, and malformed-input tests. A compiler build with the separate binary64 helpers is required.
 2. **Single-server command client — implemented:** URI parsing, TCP/TLS, SCRAM-SHA-256, handshake, OP_MSG commands, server errors, deadlines, and scripted-peer tests.
 3. **Backend operations — implemented:** insert/find/update/delete helpers, cursor getMore/killCursors, bounded batches, and FIFO connection pooling with waiter limits and shutdown.
-4. **Interoperability and release — remaining:** direct CRUD, update, insert, and cursor reads were exercised against MongoDB 8.2.12 on 2026-10-11. Authenticated and TLS live-server coverage, the supported server-version range, clean consumer install, and a release tag remain.
-5. **Cluster connectivity — initial discovery implemented:** `mongodb+srv`
+4. **Aggregation and transactions — implemented:** pipeline cursors support
+   `$match`, `$sort`, `$group`, `$project`, `getMore`, and cursor cleanup.
+   Sessions carry `lsid`; transaction commands carry `txnNumber`,
+   `autocommit`, and the first-operation marker. Pooled sessions pin one
+   connection until ended. Scripted tests cover malformed replies, cursor
+   cleanup, transaction isolation, and explicit commit retry after an unknown
+   result.
+5. **Live interoperability — implemented for MongoDB 8.2.12:**
+   `tests/live/run.sh` builds temporary TLS/SCRAM and one-node replica-set
+   servers. It passed verified TLS, authentication, aggregation with a second
+   batch, transaction commit, and abort/rollback on 2026-10-11. Other server
+   versions and Atlas itself have not been qualified.
+6. **Cluster connectivity — initial discovery implemented:** `mongodb+srv`
    URI parsing, bounded SRV/TXT resolution, seed validation, TXT defaults,
    and initial writable-primary selection are available. Automatic topology
    monitoring, failover, retryable writes, and load-balanced mode remain out
    of scope. This package change depends on the companion compiler change for
    `net.lookup_srv_until` and `net.lookup_txt_until`.
-6. **Measurement — live database baseline complete (2026-10-11):** `bench/bson/run.sh` compares the in-memory BSON codec with the official Go MongoDB BSON codec. A separate 64-run live comparison used MongoDB 8.2.12, 500,000 seeded 1 KiB documents, three indexes, and four interleaved samples per client and route/concurrency pair. Reads, updates, and inserts were within 2%–17% of Go throughput; the sorted 50-document range path reached 23% of Go at 16 workers (628 vs 2,684 requests/s), with p50/p99 of 19.71/64.00 ms vs 5.40/14.21 ms. All correctness checks passed. This is a local Mac-plus-Docker diagnostic, not a cloud deployment baseline; the full interpretation and next work are below.
+7. **Measurement — sorted-range optimization measured (2026-10-11):** eight
+   read-only samples per implementation and worker count compared the pre-change
+   decoder, current decoder, and Go on the same MongoDB 8.2.12 dataset. The
+   dataset contains 500,000 documents with 1 KiB payloads and the `_id_`,
+   `tenant_seq`, and `status_tenant` indexes. Each request returns and validates
+   50 sorted documents. At 16 workers, current median throughput is 1,082.5
+   req/s versus 685 for the old decoder and 2,762.5 for Go; current p50/p99 is
+   11.50/42.47 ms versus 19.38/56.03 ms before and 5.22/12.76 ms for Go. Median
+   client RSS fell from 63.52 to 48.98 MiB and retired instructions from 58.23
+   to 32.02 billion. The local Mac/Docker result is diagnostic, not a cloud
+   server benchmark. The optimization is substantial but does not meet the
+   original 98%-of-Go throughput and 1.02x-Go p99 goal.
 
-The initial driver now supports direct connections and SRV seed discovery. It
-does not provide replica-set failover, topology monitoring, or live Atlas
-verification.
+## Current API and remaining work
 
-## Current API coverage and ordered next work
+`aggregate(collection, pipeline, batch_size, deadline)` and
+`pool_aggregate(pool, collection_name, pipeline, batch_size, deadline)` accept
+`[Document]` stages and return the bounded cursor used by `find`. The cursor
+keeps batches bounded, sends `getMore` as needed, and can kill a live cursor
+when closed early.
 
-`command`, `command_on`, and their pool variants accept caller-built BSON
-command documents. An application can manually construct an `aggregate`
-command and pipeline using the existing `Document` and `Array` types. The reply
-is a raw `Document`, however: there is no `aggregate` helper that creates the
-package `Cursor` and manages `firstBatch`, `getMore`, and early close. There is
-also no first-class `Session` or transaction API that manages `lsid`,
-`txnNumber`, transaction state, and session-aware operations. These features
-are not currently supported as driver-managed APIs.
+`start_session` and `pool_start_session` create sessions. `session_collection`
+and `session_command` attach the session id to commands. Transactions use
+`begin_transaction`, `commit_transaction`, and `abort_transaction`, followed by
+`end_session`. A pooled Session holds its connection until it ends. Transactions
+are restricted to a writable primary in a replica set. The API does not retry
+ambiguous commits automatically; returned errors preserve MongoDB error labels
+so callers can decide whether to retry commit with the same Session.
 
-Work these items in order, one change at a time:
+The next performance task is further reducing the remaining sorted-range cost.
+The current implementation validates incoming UTF-8 once, stores ordinary
+BSON strings as slang strings, and reuses decoded batch arrays rather than
+copying them. The table reports medians over eight read-only samples per build
+and worker count; each request checks 50 returned documents.
 
-1. **Profile and optimize sorted range reads.** The live baseline used 50
-   sorted documents per request, each with a 1 KiB payload. At 16 workers,
-   median throughput was 628 requests/s for slang and 2,684 for Go; p50/p99
-   were 19.71/64.00 ms and 5.40/14.21 ms respectively. MongoDB's explain plan
-   returned and examined exactly 50 documents and 50 keys through the
-   `tenant_seq` index. Profile client-side BSON decode, dynamic document
-   materialization, field lookup, string conversion, and allocation/GC before
-   changing code. The benchmark validates each returned payload; `as_string`
-   also validates UTF-8 and materializes slang strings, so measure that cost
-   separately before attributing the whole gap to wire decoding. Keep a
-   repeated Go comparison with p99 and client RSS. Target at least 98% of Go's
-   throughput and p99 no more than 2% above Go on the same stable host, without
-   regressing point CRUD or correctness.
-2. **Add aggregation and pipeline cursor support.** Expose an `aggregate` and
-   pooled equivalent that accept dynamic `[Document]` pipeline stages and
-   return the existing bounded `Cursor`, including `getMore`, deadlines, and
-   `killCursors` cleanup. Start without a fluent stage-builder DSL: the BSON
-   `Document`/`Value` API already lets callers express server pipeline stages.
-   Keep options narrow initially (at least batch size), and test multiple
-   batches, early close, malformed replies, server errors, and live `$match`,
-   `$sort`, `$group`, and `$project` results.
-3. **Add explicit sessions and replica-set transactions.** Define a public
-   session handle and explicit begin, commit, abort, and end operations; do not
-   use a callback-based helper because slang has no closures. Carry `lsid` and
-   transaction fields through session-aware CRUD and aggregation calls, keep
-   operations on the selected writable-primary topology, and report ambiguous
-   commit outcomes without retrying writes blindly. Start with replica sets;
-   sharded transaction routing remains deferred until mongos routing exists.
-   Validate commit, abort/rollback, expiry, command errors, and concurrent
-   session isolation against a replica-set test deployment.
-4. **Close release gates.** Add pinned-server integration coverage for TLS and
-   authentication, state the supported MongoDB server range and remaining
-   topology limits, run the consumer install fixture from a clean cache, then
-   tag a release. Keep change streams, retryable writes, failover monitoring,
-   sharded routing, and load-balanced mode out of scope until separately
-   prioritized.
+| Workers | Build | Requests/s | p50 (ms) | p99 (ms) | RSS (MiB) | Retired instructions (B) |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | Before | 225.5 | 4.371 | 5.618 | 18.78 | 3.60 |
+| 1 | Current slang | 351.0 | 2.757 | 3.780 | 12.02 | 2.00 |
+| 1 | Go | 953.5 | 0.993 | 1.756 | 13.28 | 0.35 |
+| 16 | Before | 685.0 | 19.377 | 56.034 | 63.52 | 58.23 |
+| 16 | Current slang | 1,082.5 | 11.501 | 42.473 | 48.98 | 32.02 |
+| 16 | Go | 2,762.5 | 5.224 | 12.757 | 16.42 | 5.76 |
+
+At 16 workers the change improved throughput 58%, p99 24%, RSS 23%, and retired
+instructions 45% against the pre-change decoder. It reaches 39% of Go
+throughput and has 3.3x Go p99. At one worker it reaches 37% of Go throughput
+with 2.2x Go p99. Do not claim parity until a new measured change closes that
+gap without increasing memory unsafely.
+
+Release work remains: run a clean Git-pinned consumer install after publishing
+the source branch, qualify any additional MongoDB versions before claiming
+them, and create a version tag only after those checks pass. The current
+validated server point is 8.2.12; no broader compatibility range is claimed.
 
 ## Security and compatibility requirements
 
@@ -121,14 +132,16 @@ Work these items in order, one change at a time:
 - Do not retry a write after an ambiguous timeout unless the selected retry contract can prove whether it is safe.
 - Do not expose passwords in errors, logs, or debug output.
 - Keep tests deterministic and independent of a running MongoDB service. Add an opt-in integration suite for a pinned server version.
-- Maintain an explicit supported server-version range and BSON type matrix in the README before publishing a release.
+- Maintain the tested MongoDB version and BSON type matrix in the README before publishing a release.
 
 ## Validation and release gates
 
 - A regression test must demonstrate each protocol or safety defect before the fix and pass after it.
 - Exercise URI parsing, BSON round trips, numeric boundaries, nested and oversized documents, truncated frames, bad lengths, request-id mismatches, command errors, timeouts, authentication failures, TLS verification, pool wakeups, and connection reuse.
-- Run `slangc test` for the package and a consumer fixture that pins the repository by Git/tag and imports `mongo`.
-- Run live MongoDB integration tests separately from the default suite.
+- Run `slangc test -v src/mongo`, the local consumer smoke test, and
+  `tests/live/run.sh` separately.
+- Before tagging, run a clean-cache consumer fixture pinned to the pushed
+  source, then repeat with the release tag.
 - Measure any claimed performance change using repeated, interleaved runs against Go on the same host and database; include p99 and RSS as well as throughput.
 - Publish versioned tags only after docs, license, supported-version policy, and clean-install verification are complete.
 
@@ -140,8 +153,8 @@ Authentication and TLS behavior should be checked against the official [MongoDB 
 
 ## Decisions recorded before driver implementation
 
-1. **BSON/document API — decided:** Expose a dynamic `Document`/`Value` model in the standalone package. Typed-struct codecs can be considered later, likely through generated codecs or compiler support; the package itself cannot reflect over arbitrary struct fields at runtime.
-2. **Topology — decided:** Support one direct `mongodb://` endpoint first. Defer replica-set discovery, multiple seeds, and `mongodb+srv://` until the language exposes the required DNS and topology support.
-3. **Operation surface — decided:** Include raw commands, basic insert/find/update/delete helpers, cursor iteration, and a connection pool in the first usable release.
+1. **BSON/document API — decided:** Expose a dynamic `Document`/`Value` model. Typed-struct codecs can be considered later through generated codecs or compiler support; the package cannot reflect over arbitrary struct fields at runtime.
+2. **Topology — current:** Direct endpoints and bounded `mongodb+srv://` seed discovery are supported. Failover monitoring and sharded routing are deferred.
+3. **Operation surface — current:** Raw commands, CRUD, cursors, aggregation pipelines, explicit sessions and replica-set transactions, and a bounded connection pool are implemented.
 
 **License:** MIT, matching the slang compiler repository.

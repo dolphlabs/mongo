@@ -374,6 +374,29 @@ pub fn pool_find(p: Pool, collection_name: str, filter: Document,
     return ok(cur);
 }
 
+pub fn pool_aggregate(p: Pool, collection_name: str, pipeline: [Document],
+                      batch_size: int, deadline: until)
+                     -> result[Cursor, str] {
+    let acquired = acquire(p, deadline);
+    guard let c = acquired else let e = err_of(acquired) { return err(e); }
+    let col = collection(c, collection_name);
+    guard let target = col else let e = err_of(col) {
+        release(p, c);
+        return err(e);
+    }
+    let opened = aggregate(target, pipeline, batch_size, deadline);
+    guard let cur = opened else let e = err_of(opened) {
+        release(p, c);
+        return err(e);
+    }
+    cur.pool = some(p);
+    if cur.id == 0 && len(cur.batch) == 0 {
+        cur.closed = true;
+        mongo_cursor_release_pool(cur);
+    }
+    return ok(cur);
+}
+
 pub fn pool_insert_one(p: Pool, collection_name: str, doc: Document,
                        deadline: until) -> result[Document, str] {
     let acquired = acquire(p, deadline);
@@ -438,6 +461,13 @@ pub fn pool_close(p: Pool) {
 }
 
 fn mongo_cursor_release_pool(cur: Cursor) {
+    if cur.session_counted {
+        cur.session_counted = false;
+        guard let session = cur.session else { return; }
+        if session.active_cursors > 0 {
+            session.active_cursors = session.active_cursors - 1;
+        }
+    }
     guard let p = cur.pool else { return; }
     cur.pool = none;
     release(p, cur.connection);

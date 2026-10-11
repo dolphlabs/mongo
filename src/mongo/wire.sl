@@ -17,6 +17,8 @@ pub gc struct Conn {
     pool_checked_out: bool,
     server_max_wire_version: int,
     is_writable_primary: bool,
+    server_set_name: str,
+    logical_session_timeout_minutes: int,
 }
 
 struct OpMessage {
@@ -229,26 +231,59 @@ fn mongo_check_command_status(body: Document) -> result[bool, str] {
     }
     let message = "command failed";
     let details = get(body, "errmsg");
-    guard let error_value = details else {
-        return err("mongo command failed: " + message);
-    }
-    let error_text = as_string(error_value);
-    guard let text = error_text else {
-        return err("mongo.command protocol: errmsg is not a string");
-    }
-    message = text;
-    if len(message) > 1024 {
-        message = strings.slice(message, 0, 1024);
+    if let error_value = details {
+        let error_text = as_string(error_value);
+        guard let text = error_text else {
+            return err("mongo.command protocol: errmsg is not a string");
+        }
+        message = text;
+        if len(message) > 1024 {
+            message = strings.slice(message, 0, 1024);
+        }
     }
     let code_text = "";
     let code_field = get(body, "code");
-    guard let code_value = code_field else {
-        return err("mongo command failed: " + message);
+    if let code_value = code_field {
+        if code_value.kind == BSON_INT32 || code_value.kind == BSON_INT64 {
+            code_text = " [" + to_str(code_value.int_value) + "]";
+        }
     }
-    if code_value.kind == BSON_INT32 || code_value.kind == BSON_INT64 {
-        code_text = " [" + to_str(code_value.int_value) + "]";
+    let labels = mongo_command_error_labels(body);
+    guard let label_text = labels else let e = err_of(labels) { return err(e); }
+    return err("mongo command failed" + code_text + label_text + ": " + message);
+}
+
+fn mongo_command_error_labels(body: Document) -> result[str, str] {
+    let field = get(body, "errorLabels");
+    guard let value = field else { return ok(""); }
+    let decoded = as_array(value);
+    guard let labels = decoded else {
+        return err("mongo.command protocol: errorLabels is not an array");
     }
-    return err("mongo command failed" + code_text + ": " + message);
+    if len(labels) > 16 {
+        return err("mongo.command protocol: too many error labels");
+    }
+    let out = "";
+    let i = 0;
+    while i < len(labels) {
+        let label_result = as_string(labels[i]);
+        guard let label = label_result else let e = err_of(label_result) {
+            return err("mongo.command protocol: invalid error label: " + e);
+        }
+        if label == "" || len(label) > 64 {
+            return err("mongo.command protocol: error label length is invalid");
+        }
+        if i == 0 {
+            out = " [errorLabels=" + label;
+        } else {
+            out = out + "," + label;
+        }
+        i = i + 1;
+    }
+    if len(labels) > 0 {
+        out = out + "]";
+    }
+    return ok(out);
 }
 
 fn mongo_transport_send(c: Conn, payload: bytes, deadline: until)
