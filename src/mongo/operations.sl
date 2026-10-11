@@ -3,6 +3,7 @@ import "strings";
 pub gc struct Collection {
     connection: Conn,
     name: str,
+    session: opt[Session],
 }
 
 pub gc struct FindOptions {
@@ -16,6 +17,8 @@ pub gc struct FindOptions {
 pub gc struct Cursor {
     connection: Conn,
     pool: opt[Pool],
+    session: opt[Session],
+    session_counted: bool,
     collection: str,
     id: int,
     batch: [Value],
@@ -27,7 +30,7 @@ pub gc struct Cursor {
 pub fn collection(c: Conn, name: str) -> result[Collection, str] {
     let valid = mongo_validate_collection(name);
     guard let _valid = valid else let e = err_of(valid) { return err(e); }
-    return ok(Collection { connection: c, name: name });
+    return ok(Collection { connection: c, name: name, session: none });
 }
 
 pub fn default_find_options() -> FindOptions {
@@ -116,9 +119,45 @@ pub fn find(col: Collection, filter: Document, options: FindOptions,
         let added = put(command_doc, "sort", document_value(sort_doc));
         guard let _added = added else let e = err_of(added) { return err(e); }
     }
-    let reply = command(col.connection, command_doc, deadline);
+    let reply = mongo_collection_command(col, command_doc, deadline);
     guard let response = reply else let e = err_of(reply) { return err(e); }
-    return mongo_cursor_from_reply(col, response, options.batch_size);
+    return mongo_cursor_from_reply(col, response, options.batch_size,
+                                   "find", deadline);
+}
+
+pub fn aggregate(col: Collection, pipeline: [Document], batch_size: int,
+                 deadline: until) -> result[Cursor, str] {
+    let valid_collection = mongo_validate_collection(col.name);
+    guard let _collection = valid_collection else let e = err_of(valid_collection) {
+        return err(e);
+    }
+    let valid_size = mongo_validate_batch_size(batch_size);
+    guard let _size = valid_size else let e = err_of(valid_size) { return err(e); }
+    if len(pipeline) > DEFAULT_MAX_BSON_VALUES {
+        return err("mongo.aggregate: pipeline exceeds the BSON value limit");
+    }
+    let stages: [Value] = [];
+    let i = 0;
+    while i < len(pipeline) {
+        push(stages, document_value(pipeline[i]));
+        i = i + 1;
+    }
+    let command_doc = document();
+    let named = mongo_put_string(command_doc, "aggregate", col.name);
+    guard let _named = named else let e = err_of(named) { return err(e); }
+    let listed = put(command_doc, "pipeline", bson_array_value_owned(stages));
+    guard let _listed = listed else let e = err_of(listed) { return err(e); }
+    let cursor_options = document();
+    if batch_size > 0 {
+        let size = put(cursor_options, "batchSize", int64_value(batch_size));
+        guard let _size_added = size else let e = err_of(size) { return err(e); }
+    }
+    let cursor_added = put(command_doc, "cursor", document_value(cursor_options));
+    guard let _cursor = cursor_added else let e = err_of(cursor_added) { return err(e); }
+    let response = mongo_collection_command(col, command_doc, deadline);
+    guard let reply = response else let e = err_of(response) { return err(e); }
+    return mongo_cursor_from_reply(col, reply, batch_size,
+                                   "aggregate", deadline);
 }
 
 pub fn find_one(col: Collection, filter: Document, deadline: until)
@@ -263,7 +302,7 @@ pub fn cursor_close(cur: Cursor, deadline: until) -> result[bool, str] {
         cur.closed = true;
         return err(e);
     }
-    let response = command(cur.connection, command_doc, deadline);
+    let response = mongo_cursor_command(cur, command_doc, deadline);
     cur.closed = true;
     mongo_cursor_release_pool(cur);
     guard let _reply = response else let e = err_of(response) { return err(e); }
@@ -284,7 +323,7 @@ fn mongo_cursor_get_more(cur: Cursor, deadline: until) -> result[bool, str] {
         let size = put(command_doc, "batchSize", int64_value(cur.batch_size));
         guard let _size = size else let e = err_of(size) { return err(e); }
     }
-    let response = command(cur.connection, command_doc, deadline);
+    let response = mongo_cursor_command(cur, command_doc, deadline);
     guard let reply = response else let e = err_of(response) { return err(e); }
     let cursor_field = get(reply, "cursor");
     guard let cursor_value = cursor_field else {
@@ -297,20 +336,23 @@ fn mongo_cursor_get_more(cur: Cursor, deadline: until) -> result[bool, str] {
     return mongo_cursor_update(cur, cursor_doc, "nextBatch");
 }
 
-fn mongo_cursor_from_reply(col: Collection, reply: Document, batch_size: int)
+fn mongo_cursor_from_reply(col: Collection, reply: Document, batch_size: int,
+                           operation: str, deadline: until)
                           -> result[Cursor, str] {
     let cursor_field = get(reply, "cursor");
     guard let cursor_value = cursor_field else {
-        return err("mongo.find: response omitted cursor");
+        return err("mongo." + operation + ": response omitted cursor");
     }
     let cursor_result = as_document(cursor_value);
     guard let cursor_doc = cursor_result else let e = err_of(cursor_result) {
-        return err("mongo.find: invalid cursor: " + e);
+        return err("mongo." + operation + ": invalid cursor: " + e);
     }
     let no_batch: [Value] = [];
     let cur = Cursor {
         connection: col.connection,
         pool: none,
+        session: col.session,
+        session_counted: false,
         collection: col.name,
         id: 0,
         batch: no_batch,
@@ -320,9 +362,16 @@ fn mongo_cursor_from_reply(col: Collection, reply: Document, batch_size: int)
     };
     let loaded = mongo_cursor_update(cur, cursor_doc, "firstBatch");
     guard let _loaded = loaded else let e = err_of(loaded) {
-        cur.closed = true;
+        if cur.id != 0 {
+            let ignored = cursor_close(cur, deadline);
+        } else {
+            cur.closed = true;
+        }
         return err(e);
     }
+    guard let session = col.session else { return ok(cur); }
+    session.active_cursors = session.active_cursors + 1;
+    cur.session_counted = true;
     return ok(cur);
 }
 
@@ -336,14 +385,17 @@ fn mongo_cursor_update(cur: Cursor, reply: Document, batch_name: str)
     guard let id = id_result else let e = err_of(id_result) {
         return err("mongo.cursor: invalid cursor id: " + e);
     }
+    cur.id = id;
     let batch_field = get(reply, batch_name);
     guard let batch_value = batch_field else {
         return err("mongo.cursor: response omitted " + batch_name);
     }
-    let batch_result = as_array(batch_value);
-    guard let items = batch_result else let e = err_of(batch_result) {
-        return err("mongo.cursor: invalid batch: " + e);
+    if batch_value.kind != BSON_ARRAY {
+        return err("mongo.cursor: invalid batch: value is not a BSON array");
     }
+    // The decoded reply owns this immutable-in-practice list. Keeping its
+    // reference avoids copying every Value in every network batch.
+    let items = batch_value.items;
     if len(items) > DEFAULT_MAX_BSON_VALUES {
         return err("mongo.cursor: batch exceeds configured value limit");
     }
@@ -354,7 +406,6 @@ fn mongo_cursor_update(cur: Cursor, reply: Document, batch_name: str)
         }
         i = i + 1;
     }
-    cur.id = id;
     cur.batch = items;
     cur.index = 0;
     return ok(true);
@@ -366,10 +417,13 @@ fn mongo_write_command(col: Collection, body: Document, deadline: until)
     guard let _collection = valid_collection else let e = err_of(valid_collection) {
         return err(e);
     }
-    let response = command(col.connection, body, deadline);
+    let response = mongo_collection_command(col, body, deadline);
     guard let reply = response else let e = err_of(response) { return err(e); }
     let valid = mongo_check_write_reply(reply);
-    guard let _valid = valid else let e = err_of(valid) { return err(e); }
+    guard let _valid = valid else let e = err_of(valid) {
+        mongo_session_mark_failed(col.session);
+        return err(e);
+    }
     return ok(reply);
 }
 
@@ -430,6 +484,13 @@ fn mongo_validate_find_options(options: FindOptions) -> result[bool, str] {
        options.skip > 2147483647 || options.limit > 2147483647 ||
        options.batch_size > 2147483647 {
         return err("mongo.find: skip, limit, and batch_size must fit a non-negative int32");
+    }
+    return ok(true);
+}
+
+fn mongo_validate_batch_size(batch_size: int) -> result[bool, str] {
+    if batch_size < 0 || batch_size > 2147483647 {
+        return err("mongo.aggregate: batch_size must fit a non-negative int32");
     }
     return ok(true);
 }

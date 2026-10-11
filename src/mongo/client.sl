@@ -86,7 +86,9 @@ fn mongo_connect_host(cfg: Config, host: str, port: int, deadline: until,
         pool_managed: false,
         pool_checked_out: false,
         server_max_wire_version: 0,
-        is_writable_primary: false
+        is_writable_primary: false,
+        server_set_name: "",
+        logical_session_timeout_minutes: 0
     };
     let hello = mongo_handshake(connection, deadline);
     guard let _hello = hello else let e = err_of(hello) {
@@ -167,6 +169,25 @@ fn mongo_handshake(c: Conn, deadline: until) -> result[bool, str] {
         return err("mongo.connect: server does not support the OP_MSG protocol");
     }
     c.server_max_wire_version = version;
+    let set_name_field = get(reply, "setName");
+    if let set_name_value = set_name_field {
+        let set_name_result = as_string(set_name_value);
+        guard let set_name = set_name_result else let e = err_of(set_name_result) {
+            return err("mongo.connect: invalid setName: " + e);
+        }
+        c.server_set_name = set_name;
+    }
+    let session_timeout_field = get(reply, "logicalSessionTimeoutMinutes");
+    if let session_timeout_value = session_timeout_field {
+        let timeout_result = as_int(session_timeout_value);
+        guard let timeout = timeout_result else let e = err_of(timeout_result) {
+            return err("mongo.connect: invalid logicalSessionTimeoutMinutes: " + e);
+        }
+        if timeout < 0 {
+            return err("mongo.connect: logicalSessionTimeoutMinutes cannot be negative");
+        }
+        c.logical_session_timeout_minutes = timeout;
+    }
     let primary = get(reply, "isWritablePrimary");
     if let primary_value = primary {
         let primary_result = as_bool(primary_value);

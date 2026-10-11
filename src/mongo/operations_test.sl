@@ -51,9 +51,13 @@ fn test_mongo_cursor_first_batch_values() {
             pool_managed: false,
             pool_checked_out: false,
             server_max_wire_version: 0,
-            is_writable_primary: false
+            is_writable_primary: false,
+            server_set_name: "",
+            logical_session_timeout_minutes: 0
         },
         pool: none,
+        session: none,
+        session_counted: false,
         collection: "users",
         id: 0,
         batch: empty_batch,
@@ -97,12 +101,16 @@ fn test_mongo_cursor_deadline_releases_connection() {
         pool_managed: false,
         pool_checked_out: false,
         server_max_wire_version: 0,
-        is_writable_primary: false
+        is_writable_primary: false,
+        server_set_name: "",
+        logical_session_timeout_minutes: 0
     };
     let no_batch: [Value] = [];
     let cur = Cursor {
         connection: conn,
         pool: none,
+        session: none,
+        session_counted: false,
         collection: "users",
         id: 5,
         batch: no_batch,
@@ -377,6 +385,544 @@ fn test_mongo_network_connect_crud_and_cursor_get_more() {
         return;
     }
     panic("MongoDB cursor returned extra rows after getMore exhausted it");
+}
+
+fn mongo_test_pipeline() -> [Document] {
+    let match_filter = document();
+    mongo_operations_test_add(match_filter, "kind", string_value("event"));
+    let match_stage = document();
+    mongo_operations_test_add(match_stage, "$match", document_value(match_filter));
+    let sort_fields = document();
+    mongo_operations_test_add(sort_fields, "seq", int32_test_value(1));
+    let sort_stage = document();
+    mongo_operations_test_add(sort_stage, "$sort", document_value(sort_fields));
+    let stages: [Document] = [];
+    push(stages, match_stage);
+    push(stages, sort_stage);
+    return stages;
+}
+
+fn mongo_test_aggregate_server(listener: i32, done: chan[int], mode: int) {
+    let deadline = until_of(time.mono() + 5000000000);
+    let accepted = net.accept(listener);
+    guard let fd = accepted else let e = err_of(accepted) { panic(e); }
+    let cfg_result = new_config("127.0.0.1", 27017, "test");
+    guard let cfg = cfg_result else let e = err_of(cfg_result) { panic(e); }
+    let request_count = 3;
+    if mode == 2 { request_count = 2; }
+    let request_index = 0;
+    while request_index < request_count {
+        let header = mongo_test_read_exact(fd, 16, deadline);
+        let size = mongo_wire_read_i32(header, 0);
+        if size < 21 || size > DEFAULT_MAX_MESSAGE_BYTES {
+            panic("mock aggregate peer received an invalid request length");
+        }
+        let tail = mongo_test_read_exact(fd, size - 16, deadline);
+        let raw = header + tail;
+        let request_id = mongo_wire_read_i32(raw, 4);
+        let parsed = mongo_decode_op_msg(raw, 0, cfg);
+        guard let request = parsed else let e = err_of(parsed) { panic(e); }
+        let reply = document();
+        mongo_operations_test_add(reply, "ok", double_value(1.0));
+        if request_index == 0 {
+            assert(has_field(request.body, "hello"), "aggregate client omitted hello");
+            mongo_operations_test_add(reply, "maxWireVersion", int32_test_value(21));
+            mongo_operations_test_add(reply, "maxBsonObjectSize",
+                                      int32_test_value(DEFAULT_MAX_BSON_BYTES));
+            mongo_operations_test_add(reply, "maxMessageSizeBytes",
+                                      int32_test_value(DEFAULT_MAX_MESSAGE_BYTES));
+        } else if request_index == 1 {
+            assert(has_field(request.body, "aggregate"), "pipeline used the wrong command");
+            let collection_value = get(request.body, "aggregate");
+            guard let collection_bson = collection_value else {
+                panic("aggregate command omitted collection");
+            }
+            let collection_name = as_string(collection_bson);
+            guard let collection_text = collection_name else let e = err_of(collection_name) {
+                panic(e);
+            }
+            assert(collection_text == "users", "aggregate targeted the wrong collection");
+            let pipeline_value = get(request.body, "pipeline");
+            guard let pipeline_bson = pipeline_value else {
+                panic("aggregate command omitted pipeline");
+            }
+            let pipeline_result = as_array(pipeline_bson);
+            guard let pipeline = pipeline_result else let e = err_of(pipeline_result) {
+                panic(e);
+            }
+            if mode == 4 {
+                assert(len(pipeline) == 0, "empty pipeline changed");
+            } else {
+                assert(len(pipeline) == 2, "pipeline stage count changed");
+                let first_stage = as_document(pipeline[0]);
+                guard let match_doc = first_stage else let e = err_of(first_stage) { panic(e); }
+                assert(has_field(match_doc, "$match"), "$match stage was not encoded");
+                let second_stage = as_document(pipeline[1]);
+                guard let sort_doc = second_stage else let e = err_of(second_stage) { panic(e); }
+                assert(has_field(sort_doc, "$sort"), "$sort stage was not encoded");
+            }
+            let cursor_value = get(request.body, "cursor");
+            guard let cursor_bson = cursor_value else { panic("aggregate omitted cursor options"); }
+            let cursor_result = as_document(cursor_bson);
+            guard let cursor_options = cursor_result else let e = err_of(cursor_result) { panic(e); }
+            if mode != 4 {
+                let size_value = get(cursor_options, "batchSize");
+                guard let size_bson = size_value else { panic("aggregate omitted batchSize"); }
+                let size_result = as_int(size_bson);
+                guard let size = size_result else let e = err_of(size_result) { panic(e); }
+                assert(size == 1, "aggregate batch size changed");
+            }
+            if mode == 2 {
+                mongo_operations_test_add(reply, "ok", double_value(0.0));
+                mongo_operations_test_add(reply, "errmsg", string_value("pipeline rejected"));
+            } else {
+                let cursor_reply = document();
+                let cursor_id = 77;
+                if mode == 4 { cursor_id = 0; }
+                mongo_operations_test_add(cursor_reply, "id", int64_value(cursor_id));
+                mongo_operations_test_add(cursor_reply, "ns", string_value("test.users"));
+                if mode == 1 {
+                    mongo_operations_test_add(cursor_reply, "firstBatch", string_value("bad"));
+                } else {
+                    let docs: [Value] = [];
+                    if mode != 4 {
+                        let row = document();
+                        mongo_operations_test_add(row, "seq", int64_value(1));
+                        push(docs, document_value(row));
+                    }
+                    mongo_operations_test_add(cursor_reply, "firstBatch", array_value(docs));
+                }
+                mongo_operations_test_add(reply, "cursor", document_value(cursor_reply));
+            }
+        } else if mode == 0 {
+            assert(has_field(request.body, "getMore"), "aggregate cursor omitted getMore");
+            let id_value = get(request.body, "getMore");
+            guard let id_bson = id_value else { panic("getMore omitted cursor id"); }
+            let id_result = as_int64(id_bson);
+            guard let id = id_result else let e = err_of(id_result) { panic(e); }
+            assert(id == 77, "aggregate getMore used the wrong cursor id");
+            let cursor_reply = document();
+            mongo_operations_test_add(cursor_reply, "id", int64_value(0));
+            let row = document();
+            mongo_operations_test_add(row, "seq", int64_value(2));
+            let docs: [Value] = [];
+            push(docs, document_value(row));
+            mongo_operations_test_add(cursor_reply, "nextBatch", array_value(docs));
+            mongo_operations_test_add(reply, "cursor", document_value(cursor_reply));
+        } else if mode == 4 {
+            assert(has_field(request.body, "ping"), "pool connection was not reusable after empty aggregate");
+        } else {
+            assert(has_field(request.body, "killCursors"), "aggregate cleanup omitted killCursors");
+        }
+        mongo_test_send_message(fd, request_id, reply, deadline);
+        request_index = request_index + 1;
+    }
+    net.close(fd);
+    net.close(listener);
+    chan_send(done, 1);
+}
+
+fn test_mongo_aggregate_pipeline_cursor_get_more() {
+    let listening = net.listen(0);
+    guard let listener = listening else let e = err_of(listening) { panic(e); }
+    let port_result = net.port(listener);
+    guard let port = port_result else let e = err_of(port_result) { panic(e); }
+    let done: chan[int] = make_chan(1);
+    spawn mongo_test_aggregate_server(listener, done, 0);
+    let deadline = until_of(time.mono() + 5000000000);
+    let config_result = new_config("127.0.0.1", port, "test");
+    guard let config = config_result else let e = err_of(config_result) { panic(e); }
+    let connected = connect_config(config, deadline);
+    guard let conn = connected else let e = err_of(connected) { panic(e); }
+    let collection_result = collection(conn, "users");
+    guard let target = collection_result else let e = err_of(collection_result) { panic(e); }
+    let cursor_result = aggregate(target, mongo_test_pipeline(), 1, deadline);
+    guard let cursor = cursor_result else let e = err_of(cursor_result) { panic(e); }
+    let first_result = cursor_next(cursor, deadline);
+    guard let first_opt = first_result else let e = err_of(first_result) { panic(e); }
+    guard let first = first_opt else { panic("aggregate firstBatch was empty"); }
+    let first_seq = get(first, "seq");
+    guard let first_value = first_seq else { panic("aggregate first row omitted seq"); }
+    let first_number = as_int(first_value);
+    guard let first_int = first_number else let e = err_of(first_number) { panic(e); }
+    assert(first_int == 1, "aggregate first batch returned the wrong row");
+    let second_result = cursor_next(cursor, deadline);
+    guard let second_opt = second_result else let e = err_of(second_result) { panic(e); }
+    guard let second = second_opt else { panic("aggregate getMore batch was empty"); }
+    let second_seq = get(second, "seq");
+    guard let second_value = second_seq else { panic("aggregate second row omitted seq"); }
+    let second_number = as_int(second_value);
+    guard let second_int = second_number else let e = err_of(second_number) { panic(e); }
+    assert(second_int == 2, "aggregate getMore returned the wrong row");
+    let exhausted = cursor_next(cursor, deadline);
+    guard let exhausted_opt = exhausted else let e = err_of(exhausted) { panic(e); }
+    guard let _extra = exhausted_opt else {
+        close_conn(conn);
+        chan_recv(done);
+        return;
+    }
+    panic("aggregate cursor returned an extra row");
+}
+
+fn test_mongo_aggregate_malformed_batch_kills_cursor() {
+    let listening = net.listen(0);
+    guard let listener = listening else let e = err_of(listening) { panic(e); }
+    let port_result = net.port(listener);
+    guard let port = port_result else let e = err_of(port_result) { panic(e); }
+    let done: chan[int] = make_chan(1);
+    spawn mongo_test_aggregate_server(listener, done, 1);
+    let deadline = until_of(time.mono() + 5000000000);
+    let config_result = new_config("127.0.0.1", port, "test");
+    guard let config = config_result else let e = err_of(config_result) { panic(e); }
+    let connected = connect_config(config, deadline);
+    guard let conn = connected else let e = err_of(connected) { panic(e); }
+    let collection_result = collection(conn, "users");
+    guard let target = collection_result else let e = err_of(collection_result) { panic(e); }
+    let aggregate_result = aggregate(target, mongo_test_pipeline(), 1, deadline);
+    guard let _cursor = aggregate_result else let e = err_of(aggregate_result) {
+        assert(strings.contains(e, "invalid batch"), e);
+        close_conn(conn);
+        chan_recv(done);
+        return;
+    }
+    panic("aggregate accepted a malformed firstBatch");
+}
+
+fn test_mongo_aggregate_server_error_is_reported() {
+    let listening = net.listen(0);
+    guard let listener = listening else let e = err_of(listening) { panic(e); }
+    let port_result = net.port(listener);
+    guard let port = port_result else let e = err_of(port_result) { panic(e); }
+    let done: chan[int] = make_chan(1);
+    spawn mongo_test_aggregate_server(listener, done, 2);
+    let deadline = until_of(time.mono() + 5000000000);
+    let config_result = new_config("127.0.0.1", port, "test");
+    guard let config = config_result else let e = err_of(config_result) { panic(e); }
+    let connected = connect_config(config, deadline);
+    guard let conn = connected else let e = err_of(connected) { panic(e); }
+    let collection_result = collection(conn, "users");
+    guard let target = collection_result else let e = err_of(collection_result) { panic(e); }
+    let aggregate_result = aggregate(target, mongo_test_pipeline(), 1, deadline);
+    guard let _cursor = aggregate_result else let e = err_of(aggregate_result) {
+        assert(strings.contains(e, "pipeline rejected"), e);
+        close_conn(conn);
+        chan_recv(done);
+        return;
+    }
+    panic("aggregate server error was reported as success");
+}
+
+fn test_mongo_aggregate_cursor_closes_early() {
+    let listening = net.listen(0);
+    guard let listener = listening else let e = err_of(listening) { panic(e); }
+    let port_result = net.port(listener);
+    guard let port = port_result else let e = err_of(port_result) { panic(e); }
+    let done: chan[int] = make_chan(1);
+    spawn mongo_test_aggregate_server(listener, done, 3);
+    let deadline = until_of(time.mono() + 5000000000);
+    let config_result = new_config("127.0.0.1", port, "test");
+    guard let config = config_result else let e = err_of(config_result) { panic(e); }
+    let connected = connect_config(config, deadline);
+    guard let conn = connected else let e = err_of(connected) { panic(e); }
+    let collection_result = collection(conn, "users");
+    guard let target = collection_result else let e = err_of(collection_result) { panic(e); }
+    let cursor_result = aggregate(target, mongo_test_pipeline(), 1, deadline);
+    guard let cursor = cursor_result else let e = err_of(cursor_result) { panic(e); }
+    let first = cursor_next(cursor, deadline);
+    guard let first_opt = first else let e = err_of(first) { panic(e); }
+    guard let _row = first_opt else { panic("aggregate early-close batch was empty"); }
+    let closed = cursor_close(cursor, deadline);
+    guard let _closed = closed else let e = err_of(closed) { panic(e); }
+    close_conn(conn);
+    chan_recv(done);
+}
+
+fn test_mongo_pool_aggregate_releases_empty_cursor() {
+    let listening = net.listen(0);
+    guard let listener = listening else let e = err_of(listening) { panic(e); }
+    let port_result = net.port(listener);
+    guard let port = port_result else let e = err_of(port_result) { panic(e); }
+    let done: chan[int] = make_chan(1);
+    spawn mongo_test_aggregate_server(listener, done, 4);
+    let deadline = until_of(time.mono() + 5000000000);
+    let config_result = new_config("127.0.0.1", port, "test");
+    guard let config = config_result else let e = err_of(config_result) { panic(e); }
+    let pool_result = new_pool_config(config, 1);
+    guard let pool = pool_result else let e = err_of(pool_result) { panic(e); }
+    let empty_pipeline: [Document] = [];
+    let opened = pool_aggregate(pool, "users", empty_pipeline, 0, deadline);
+    guard let cursor = opened else let e = err_of(opened) { panic(e); }
+    assert(cursor.closed, "empty aggregate cursor kept a pooled connection checked out");
+    let ping = document();
+    mongo_operations_test_add(ping, "ping", int32_test_value(1));
+    let ping_result = pool_command(pool, ping, deadline);
+    guard let _reply = ping_result else let e = err_of(ping_result) { panic(e); }
+    pool_close(pool);
+    chan_recv(done);
+}
+
+fn mongo_test_request_session_id(body: Document) -> bytes {
+    let lsid_value = get(body, "lsid");
+    guard let lsid_bson = lsid_value else { panic("session command omitted lsid"); }
+    let lsid_result = as_document(lsid_bson);
+    guard let lsid = lsid_result else let e = err_of(lsid_result) { panic(e); }
+    let id_value = get(lsid, "id");
+    guard let id_bson = id_value else { panic("lsid omitted id"); }
+    assert(id_bson.kind == BSON_BINARY && id_bson.subtype == 4,
+           "lsid id is not a UUID binary");
+    let id_result = as_binary(id_bson);
+    guard let id = id_result else let e = err_of(id_result) { panic(e); }
+    assert(len(id) == 16, "lsid UUID is not 16 bytes");
+    return id;
+}
+
+fn mongo_test_assert_txn_fields(body: Document, id: bytes, number: int,
+                                first_operation: bool) {
+    let actual_id = mongo_test_request_session_id(body);
+    assert(len(actual_id) == len(id), "session UUID length changed");
+    let equal = true;
+    let i = 0;
+    while i < len(id) {
+        if actual_id[i] != id[i] { equal = false; }
+        i = i + 1;
+    }
+    assert(equal, "transaction command used a different session id");
+    let txn_value = get(body, "txnNumber");
+    guard let txn_bson = txn_value else { panic("transaction command omitted txnNumber"); }
+    let txn_result = as_int64(txn_bson);
+    guard let txn_number = txn_result else let e = err_of(txn_result) { panic(e); }
+    assert(txn_number == number, "transaction number changed");
+    let autocommit_value = get(body, "autocommit");
+    guard let autocommit_bson = autocommit_value else { panic("transaction omitted autocommit"); }
+    let autocommit_result = as_bool(autocommit_bson);
+    guard let autocommit = autocommit_result else let e = err_of(autocommit_result) { panic(e); }
+    assert(!autocommit, "transaction autocommit was not false");
+    assert(has_field(body, "startTransaction") == first_operation,
+           "startTransaction was not limited to the first operation");
+}
+
+fn mongo_test_transaction_server(listener: i32, done: chan[int]) {
+    let deadline = until_of(time.mono() + 5000000000);
+    let accepted = net.accept(listener);
+    guard let fd = accepted else let e = err_of(accepted) { panic(e); }
+    let cfg_result = new_config("127.0.0.1", 27017, "test");
+    guard let cfg = cfg_result else let e = err_of(cfg_result) { panic(e); }
+    let first_id: bytes = b"";
+    let second_id: bytes = b"";
+    let request_index = 0;
+    while request_index < 8 {
+        let header = mongo_test_read_exact(fd, 16, deadline);
+        let size = mongo_wire_read_i32(header, 0);
+        if size < 21 || size > DEFAULT_MAX_MESSAGE_BYTES {
+            panic("mock transaction peer received an invalid request length");
+        }
+        let tail = mongo_test_read_exact(fd, size - 16, deadline);
+        let raw = header + tail;
+        let request_id = mongo_wire_read_i32(raw, 4);
+        let parsed = mongo_decode_op_msg(raw, 0, cfg);
+        guard let request = parsed else let e = err_of(parsed) { panic(e); }
+        let reply = document();
+        mongo_operations_test_add(reply, "ok", double_value(1.0));
+        if request_index == 0 {
+            assert(has_field(request.body, "hello"), "session client omitted hello");
+            mongo_operations_test_add(reply, "maxWireVersion", int32_test_value(21));
+            mongo_operations_test_add(reply, "maxBsonObjectSize",
+                                      int32_test_value(DEFAULT_MAX_BSON_BYTES));
+            mongo_operations_test_add(reply, "maxMessageSizeBytes",
+                                      int32_test_value(DEFAULT_MAX_MESSAGE_BYTES));
+            mongo_operations_test_add(reply, "logicalSessionTimeoutMinutes",
+                                      int32_test_value(30));
+            mongo_operations_test_add(reply, "setName", string_value("rs-test"));
+            mongo_operations_test_add(reply, "isWritablePrimary", bool_value(true));
+        } else if request_index == 1 || request_index == 2 {
+            assert(has_field(request.body, "insert"), "session CRUD used the wrong command");
+            if request_index == 1 {
+                first_id = mongo_test_request_session_id(request.body);
+                mongo_test_assert_txn_fields(request.body, first_id, 1, true);
+            } else {
+                second_id = mongo_test_request_session_id(request.body);
+                mongo_test_assert_txn_fields(request.body, second_id, 1, true);
+                let same = true;
+                let i = 0;
+                while i < len(first_id) {
+                    if first_id[i] != second_id[i] { same = false; }
+                    i = i + 1;
+                }
+                assert(!same, "independent sessions reused the same UUID");
+            }
+            mongo_operations_test_add(reply, "n", int32_test_value(1));
+        } else if request_index == 3 {
+            assert(has_field(request.body, "abortTransaction"), "abort used the wrong command");
+            mongo_test_assert_txn_fields(request.body, first_id, 1, false);
+        } else if request_index == 4 || request_index == 5 {
+            assert(has_field(request.body, "commitTransaction"), "commit used the wrong command");
+            mongo_test_assert_txn_fields(request.body, second_id, 1, false);
+            let concern_value = get(request.body, "writeConcern");
+            guard let concern_bson = concern_value else { panic("commit omitted writeConcern"); }
+            let concern_result = as_document(concern_bson);
+            guard let concern = concern_result else let e = err_of(concern_result) { panic(e); }
+            let w_value = get(concern, "w");
+            guard let w_bson = w_value else { panic("commit writeConcern omitted w"); }
+            let w_result = as_string(w_bson);
+            guard let w = w_result else let e = err_of(w_result) { panic(e); }
+            assert(w == "majority", "commit did not request majority write concern");
+            if request_index == 4 {
+                mongo_operations_test_add(reply, "ok", double_value(0.0));
+                mongo_operations_test_add(reply, "errmsg", string_value("commit reply lost"));
+                let labels: [Value] = [];
+                push(labels, string_value("UnknownTransactionCommitResult"));
+                mongo_operations_test_add(reply, "errorLabels", array_value(labels));
+            }
+        } else {
+            assert(has_field(request.body, "endSessions"), "session cleanup omitted endSessions");
+            let ended = get(request.body, "endSessions");
+            guard let ended_value = ended else { panic("endSessions omitted its ids"); }
+            let ended_array = as_array(ended_value);
+            guard let ended_ids = ended_array else let e = err_of(ended_array) { panic(e); }
+            assert(len(ended_ids) == 1, "endSessions had the wrong id count");
+        }
+        mongo_test_send_message(fd, request_id, reply, deadline);
+        request_index = request_index + 1;
+    }
+    net.close(fd);
+    net.close(listener);
+    chan_send(done, 1);
+}
+
+fn test_mongo_sessions_transactions_isolate_and_retry_commit_explicitly() {
+    let listening = net.listen(0);
+    guard let listener = listening else let e = err_of(listening) { panic(e); }
+    let port_result = net.port(listener);
+    guard let port = port_result else let e = err_of(port_result) { panic(e); }
+    let done: chan[int] = make_chan(1);
+    spawn mongo_test_transaction_server(listener, done);
+    let deadline = until_of(time.mono() + 5000000000);
+    let config_result = new_config("127.0.0.1", port, "test");
+    guard let config = config_result else let e = err_of(config_result) { panic(e); }
+    let connected = connect_config(config, deadline);
+    guard let conn = connected else let e = err_of(connected) { panic(e); }
+    let first_result = start_session(conn);
+    guard let first = first_result else let e = err_of(first_result) { panic(e); }
+    let second_result = start_session(conn);
+    guard let second = second_result else let e = err_of(second_result) { panic(e); }
+    let first_collection_result = session_collection(first, "users");
+    guard let first_collection = first_collection_result else let e = err_of(first_collection_result) { panic(e); }
+    let second_collection_result = session_collection(second, "users");
+    guard let second_collection = second_collection_result else let e = err_of(second_collection_result) { panic(e); }
+    let first_begin = begin_transaction(first);
+    guard let _first_begun = first_begin else let e = err_of(first_begin) { panic(e); }
+    let second_begin = begin_transaction(second);
+    guard let _second_begun = second_begin else let e = err_of(second_begin) { panic(e); }
+    let doc = document();
+    mongo_operations_test_add(doc, "kind", string_value("event"));
+    let first_insert = insert_one(first_collection, doc, deadline);
+    guard let _first_inserted = first_insert else let e = err_of(first_insert) { panic(e); }
+    let second_insert = insert_one(second_collection, doc, deadline);
+    guard let _second_inserted = second_insert else let e = err_of(second_insert) { panic(e); }
+    let aborted = abort_transaction(first, deadline);
+    guard let _aborted = aborted else let e = err_of(aborted) { panic(e); }
+    let first_commit = commit_transaction(second, deadline);
+    guard let _first_commit = first_commit else let e = err_of(first_commit) {
+        assert(strings.contains(e, "commit outcome may be unknown"), e);
+        assert(strings.contains(e, "UnknownTransactionCommitResult"), e);
+        let retried = commit_transaction(second, deadline);
+        guard let _retry = retried else let retry_error = err_of(retried) { panic(retry_error); }
+        let first_ended = end_session(first, deadline);
+        guard let _first_ended = first_ended else let end_error = err_of(first_ended) { panic(end_error); }
+        let second_ended = end_session(second, deadline);
+        guard let _second_ended = second_ended else let end_error = err_of(second_ended) { panic(end_error); }
+        close_conn(conn);
+        chan_recv(done);
+        return;
+    }
+    panic("commit with an unknown outcome was silently treated as success");
+}
+
+fn mongo_test_pool_session_server(listener: i32, done: chan[int]) {
+    let deadline = until_of(time.mono() + 5000000000);
+    let accepted = net.accept(listener);
+    guard let fd = accepted else let e = err_of(accepted) { panic(e); }
+    let cfg_result = new_config("127.0.0.1", 27017, "test");
+    guard let cfg = cfg_result else let e = err_of(cfg_result) { panic(e); }
+    let expected_id: bytes = b"";
+    let request_index = 0;
+    while request_index < 5 {
+        let header = mongo_test_read_exact(fd, 16, deadline);
+        let size = mongo_wire_read_i32(header, 0);
+        if size < 21 || size > DEFAULT_MAX_MESSAGE_BYTES {
+            panic("mock pooled-session peer received an invalid request length");
+        }
+        let tail = mongo_test_read_exact(fd, size - 16, deadline);
+        let raw = header + tail;
+        let request_id = mongo_wire_read_i32(raw, 4);
+        let parsed = mongo_decode_op_msg(raw, 0, cfg);
+        guard let request = parsed else let e = err_of(parsed) { panic(e); }
+        let reply = document();
+        mongo_operations_test_add(reply, "ok", double_value(1.0));
+        if request_index == 0 {
+            assert(has_field(request.body, "hello"), "pool session omitted hello");
+            mongo_operations_test_add(reply, "maxWireVersion", int32_test_value(21));
+            mongo_operations_test_add(reply, "maxBsonObjectSize",
+                                      int32_test_value(DEFAULT_MAX_BSON_BYTES));
+            mongo_operations_test_add(reply, "maxMessageSizeBytes",
+                                      int32_test_value(DEFAULT_MAX_MESSAGE_BYTES));
+            mongo_operations_test_add(reply, "logicalSessionTimeoutMinutes",
+                                      int32_test_value(30));
+            mongo_operations_test_add(reply, "setName", string_value("rs-test"));
+            mongo_operations_test_add(reply, "isWritablePrimary", bool_value(true));
+        } else if request_index == 1 {
+            assert(has_field(request.body, "insert"), "pool session did not issue insert");
+            expected_id = mongo_test_request_session_id(request.body);
+            mongo_test_assert_txn_fields(request.body, expected_id, 1, true);
+            mongo_operations_test_add(reply, "n", int32_test_value(1));
+        } else if request_index == 2 {
+            assert(has_field(request.body, "commitTransaction"), "pool session omitted commit");
+            mongo_test_assert_txn_fields(request.body, expected_id, 1, false);
+        } else if request_index == 3 {
+            assert(has_field(request.body, "endSessions"), "pool session omitted endSessions");
+        } else {
+            assert(has_field(request.body, "ping"), "pool did not reuse the session connection");
+        }
+        mongo_test_send_message(fd, request_id, reply, deadline);
+        request_index = request_index + 1;
+    }
+    net.close(fd);
+    net.close(listener);
+    chan_send(done, 1);
+}
+
+fn test_mongo_pool_session_pins_then_releases_connection() {
+    let listening = net.listen(0);
+    guard let listener = listening else let e = err_of(listening) { panic(e); }
+    let port_result = net.port(listener);
+    guard let port = port_result else let e = err_of(port_result) { panic(e); }
+    let done: chan[int] = make_chan(1);
+    spawn mongo_test_pool_session_server(listener, done);
+    let config_result = new_config("127.0.0.1", port, "test");
+    guard let config = config_result else let e = err_of(config_result) { panic(e); }
+    let pool_result = new_pool_config(config, 1);
+    guard let pool = pool_result else let e = err_of(pool_result) { panic(e); }
+    let deadline = until_of(time.mono() + 5000000000);
+    let session_result = pool_start_session(pool, deadline);
+    guard let session = session_result else let e = err_of(session_result) { panic(e); }
+    let target_result = session_collection(session, "users");
+    guard let target = target_result else let e = err_of(target_result) { panic(e); }
+    let begun = begin_transaction(session);
+    guard let _begun = begun else let e = err_of(begun) { panic(e); }
+    let doc = document();
+    mongo_operations_test_add(doc, "kind", string_value("event"));
+    let inserted = insert_one(target, doc, deadline);
+    guard let _inserted = inserted else let e = err_of(inserted) { panic(e); }
+    let committed = commit_transaction(session, deadline);
+    guard let _committed = committed else let e = err_of(committed) { panic(e); }
+    let ended = end_session(session, deadline);
+    guard let _ended = ended else let e = err_of(ended) { panic(e); }
+    let ping = document();
+    mongo_operations_test_add(ping, "ping", int32_test_value(1));
+    let ping_result = pool_command(pool, ping, deadline);
+    guard let _reply = ping_result else let e = err_of(ping_result) { panic(e); }
+    pool_close(pool);
+    chan_recv(done);
 }
 
 fn mongo_test_seed_hello_server(listener: i32, writable: bool,

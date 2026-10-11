@@ -4,10 +4,10 @@ Standalone MongoDB driver package for slang. The repository and project name is
 `mongo`; applications import its package as `mongo` from `src/mongo`.
 Socket waits use slang's non-blocking `net` package.
 
-The current API supports direct `mongodb://` endpoints and initial seed
-discovery through `mongodb+srv://`, verified TLS, SCRAM-SHA-256, raw commands,
-common CRUD operations, cursors, and a bounded connection pool. The API is not
-yet stable or tagged for application use.
+The API supports direct `mongodb://` connections and initial seed discovery
+through `mongodb+srv://`, verified TLS, SCRAM-SHA-256, raw commands, CRUD,
+aggregation cursors, sessions, replica-set transactions, and a bounded
+connection pool. It remains pre-release and has no stable tag.
 
 ## Features and limits
 
@@ -32,10 +32,19 @@ yet stable or tagged for application use.
   retryable writes.
 - Deadline-bounded TCP/TLS connect, handshake, authentication, commands, and
   cursor reads. TLS verifies the certificate chain and host name.
-- `command`/`command_on`, collection insert/find/update/delete helpers,
-  `find_one`, `getMore`/`killCursors`, and a FIFO connection pool. A pool allows
-  at most 1,024 open connections and defaults to 10,000 queued waiters; use
-  `new_pool_config_with_limits` to set a lower waiter cap.
+- `command`/`command_on`, insert/find/update/delete helpers, `find_one`, and
+  cursors with `getMore` and `killCursors`. `aggregate` and `pool_aggregate`
+  accept `[Document]` stages and return the same bounded `Cursor` type; no
+  stage-builder DSL is required.
+- `start_session` and `pool_start_session` create explicit sessions. Session
+  collections and commands carry `lsid`; `begin_transaction`,
+  `commit_transaction`, and `abort_transaction` support replica-set
+  transactions. A pooled session pins one connection until `end_session`.
+  Use each session sequentially; concurrent operations on one session are
+  unsupported. Commit errors can have an unknown outcome, and the driver does
+  not retry commits or writes automatically.
+- The FIFO pool allows at most 1,024 open connections and defaults to 10,000
+  queued waiters; use `new_pool_config_with_limits` to lower the waiter cap.
 - Default caps of 16 MiB per BSON document, 48 MiB per wire message, 100 nested
   levels, and 100,000 BSON values per document. `new_limits` configures codec
   limits, while `Config.max_bson_bytes` and `Config.max_message_bytes` may be
@@ -112,9 +121,29 @@ mongo.close_conn(db);
 
 Use `new_pool`/`new_pool_config` for concurrent requests. Always call
 `cursor_close` when stopping cursor iteration early. Always call
-`release(pool, connection)` after an explicit `acquire`; `pool_command`,
-`pool_insert_one`, `pool_update_one`, `pool_delete_one`, and `pool_find` manage
-checkout and release for their supported operation.
+`release(pool, connection)` after an explicit `acquire`; pool operation helpers
+manage checkout and release. Exhaust or close every session cursor before
+committing, aborting, or ending its session.
+
+Build aggregation stages directly from BSON documents:
+
+```slang
+let match_filter = mongo.document();
+let added = mongo.put(match_filter, "active", mongo.bool_value(true));
+guard let _added = added else let e = err_of(added) { panic(e); }
+let match_stage = mongo.document();
+let stage_added = mongo.put(match_stage, "$match",
+                            mongo.document_value(match_filter));
+guard let _stage = stage_added else let e = err_of(stage_added) { panic(e); }
+let pipeline: [mongo.Document] = [];
+push(pipeline, match_stage);
+let cursor = mongo.aggregate(users, pipeline, 100, deadline);
+```
+
+For transactions, acquire a session from the pool, get its collection handle,
+then explicitly begin and commit or abort. Pooled sessions occupy one pool slot
+until `end_session`. Transactions require a writable-primary connection to a
+replica set; sharded routing and `mongos` are not supported.
 
 For Atlas and other DNS seed-list deployments, pass a `mongodb+srv://` URI to
 `connect` or `new_pool`. The hostname must be one DNS name without a port.
@@ -127,28 +156,35 @@ changes. A single absolute deadline covers DNS and every dial and handshake
 attempt. See [MONGO_DRIVER_PRD.md](MONGO_DRIVER_PRD.md) for the driver's scope
 and remaining release gates.
 
-## Tests
+## Compatibility and tests
 
-Run `slangc test -v src/mongo` from this repository with the compiler build
-from the companion [slang PR #373](https://github.com/dolphlabs/slang/pull/373),
-which includes the binary64 encoding helpers, `if let` syntax, and bounded DNS
-SRV/TXT lookups. Older compilers do not include those features and cannot
-build this branch; the `slangc 0.2.0` binary tested here is one such compiler.
-The deterministic suite includes a scripted local MongoDB peer for handshake,
-command, CRUD, cursor getMore, pool waiter handoff, and writable-primary
-selection; it does not need a MongoDB service. SRV/TXT wire parsing is tested
-offline in the slang
-runtime repository. A live Atlas deployment was not used. With the companion
-compiler on `PATH`, smoke-test the public import surface using
-`cd tests/consumer && slangc main.sl --run`; it prints `mongo consumer ok`.
+The live integration suite is pinned to MongoDB 8.2.12. It verifies SCRAM over
+TLS with a generated local CA, rejects wrong credentials and an untrusted CA,
+checks aggregation over multiple batches, and commits and aborts a transaction
+on a one-node replica set. Other server versions have not been qualified. The
+driver does not monitor topology changes or recover from failover; Atlas SRV
+support performs initial DNS seed discovery only.
+
+The slang compiler must provide `encoding.float64_to_le`,
+`encoding.float64_from_le`, and, for SRV URIs, deadline-bounded
+`net.lookup_srv_until` and `net.lookup_txt_until`.
+
+Run the deterministic protocol and BSON suite with `slangc test -v src/mongo`.
+It uses scripted loopback peers and needs no MongoDB server. Smoke-test the
+package import from `tests/consumer` with `slangc main.sl --run`. Run the
+opt-in real-server checks with `tests/live/run.sh`; Docker and OpenSSL are
+required. The script creates temporary authenticated/TLS and replica-set
+containers, test collections, and certificates, then removes them.
 
 The in-memory BSON codec benchmark compares this package with the official Go
 MongoDB BSON codec v1.17.10 on the same document and host. Run
 `bench/bson/run.sh` with a compiler containing the binary64 encoding helpers.
 The output includes a hash of each encoded fixture to confirm wire parity.
-This benchmark measures codec cost only; database latency, throughput, CPU,
-and RSS require a live MongoDB instance and are not inferred from these
-numbers.
+That codec benchmark measures serialization cost only. The sorted-range
+client comparison and its measured limits are recorded in
+[`MONGO_DRIVER_PRD.md`](MONGO_DRIVER_PRD.md); it is a local Mac/Docker diagnostic,
+not a cloud service benchmark. The current decoder is still slower than Go on
+that workload, despite the reduction in allocation, instructions, and RSS.
 
 ## Design notes
 
