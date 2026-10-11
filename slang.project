@@ -1,2 +1,4 @@
 name mongo
 version 0.1.0
+exclude bench
+exclude tests
