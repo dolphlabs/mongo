@@ -67,8 +67,9 @@ buffers, validates the complete BSON response, and stores byte ranges in
 `DocumentView`/`ValueView`. It uses an iterative validator so hostile nesting
 does not consume task stack. The returned view pins its source bytes; the
 cursor drops its own reference to exhausted batches, and caller-held views
-retain only the batch they reference. `view_string_len` and `view_as_binary`
-avoid materializing strings or copying binary payloads.
+retain the full batch they reference. `view_string_len` reads a string's byte
+length without materializing it. `view_as_binary` returns an independent copy
+of the payload because slang `bytes` slices copy their data.
 
 ## Out of scope
 
